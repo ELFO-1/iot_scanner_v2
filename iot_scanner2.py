@@ -28,8 +28,8 @@ from concurrent.futures import ThreadPoolExecutor  # Parallele Ausführung
 import zipfile
 
 # Konfiguration aus ini-Datei laden
-config = configparser.ConfigParser()
-config.read('iot_config2.ini')       # Einlesen der Konfigurationsdatei
+#config = configparser.ConfigParser()
+#config.read('iot_config2.ini')       # Einlesen der Konfigurationsdatei
 
 # Logging konfigurieren für Fehler- und Ereignisprotokollierung
 logging.basicConfig(
@@ -68,15 +68,81 @@ BANNER_TEXT = r"""
 
 # Hauptklasse für den IoT-Scanner
 class IOTScanner:
+
+    def check_config(self):
+        """Überprüft und erstellt die Konfigurationsdatei falls notwendig"""
+        config_file = 'iot_config2.ini'
+
+        if not os.path.exists(config_file):
+            print(f"{Color.YELLOW}Keine Konfigurationsdatei gefunden. Erstelle neue Konfiguration...{Color.RESET}")
+            config = configparser.ConfigParser()
+
+            # Standard-Konfiguration
+            config['API'] = {
+                'mac_api_key': 'your_api_key_here'
+            }
+
+            config['DATABASE'] = {
+                'db_name': 'iot_devices.db',
+                'backup_enabled': 'true',
+                'backup_interval': '86400'
+            }
+
+            config['SCAN'] = {
+                'default_network': '192.168.0.0/24',
+                'scan_timeout': '300',
+                'max_parallel_scans': '5'
+            }
+
+            config['LOGGING'] = {
+                'log_file': 'iot_scanner2.log',
+                'log_level': 'INFO'
+            }
+
+            config['EXPORT'] = {
+                'export_path': 'exports',
+                'default_format': 'all'
+            }
+
+            # Speichere Konfiguration
+            with open(config_file, 'w') as configfile:
+                config.write(configfile)
+
+            print(f"{Color.GREEN}Neue Konfigurationsdatei wurde erstellt: {config_file}{Color.RESET}")
+            print(f"{Color.YELLOW}Bitte passen Sie die Konfiguration an Ihre Bedürfnisse an.{Color.RESET}")
+            print(f"{Color.RED}API KEY z.b von https://macaddress.io MUSS ZUERST EINGETRAGEN WERDEN unter 9. Einstellungen {Color.RESET}")
+
+        # Lade Konfiguration
+        config = configparser.ConfigParser()
+        config.read(config_file)
+
+        # Überprüfe ob alle erforderlichen Abschnitte vorhanden sind
+        required_sections = ['API', 'DATABASE', 'SCAN', 'LOGGING', 'EXPORT']
+        for section in required_sections:
+            if section not in config:
+                raise ValueError(f"Fehlender Abschnitt in Konfigurationsdatei: {section}")
+
+        return config
+
     def __init__(self):
-        self.nm = nmap.PortScanner()   # Nmap-Scanner-Objekt
-        self.mac_api_key = config['API']['mac_api_key']   # API-Schlüssel für MAC-Adressen-Abfrage
-        self.db_name = config['DATABASE']['db_name']     # Name der SQLite-Datenbank
-        self.default_network = config['SCAN']['default_network']   # Standard-Netzwerkbereich
-        self.scan_profiles = self.load_scan_profiles()            # Scan-Profile aus JSON-Datei
-        self.current_network = None     # Aktueller Netzwerkbereich
-        self.scanning = False            # Flag für laufende Scans
-        self.setup_database()           # Datenbank-Initialisierung
+        try:
+            # Zuerst Konfiguration überprüfen und laden
+            self.config = self.check_config()
+
+            # Dann die Attribute mit der geladenen Konfiguration initialisieren
+            self.nm = nmap.PortScanner()
+            self.mac_api_key = self.config['API']['mac_api_key']
+            self.db_name = self.config['DATABASE']['db_name']
+            self.default_network = self.config['SCAN']['default_network']
+            self.scan_profiles = self.load_scan_profiles()
+            self.current_network = None
+            self.scanning = False
+            self.setup_database()
+
+        except Exception as e:
+            logging.critical(f"Fehler bei der Initialisierung: {str(e)}")
+            raise
+
 
 
     def load_scan_profiles(self) -> Dict:  # Laden der Scan-Profile aus JSON-Datei
@@ -879,25 +945,25 @@ class IOTScanner:
         while True:
             print(f"\n{Color.GREEN}=== Einstellungen ==={Color.RESET}")
             print(f"\n{Color.YELLOW}Scan-Einstellungen:{Color.RESET}")
-            print(f"1. Standard-Netzwerk: {config.get('SCAN', 'default_network', fallback='192.168.0.0/24')}")
-            print(f"2. Scan-Timeout: {config.get('SCAN', 'scan_timeout', fallback='300')} Sekunden")
-            print(f"3. Max. parallele Scans: {config.get('SCAN', 'max_parallel_scans', fallback='5')}")
+            print(f"1. Standard-Netzwerk: {self.config.get('SCAN', 'default_network', fallback='192.168.0.0/24')}")
+            print(f"2. Scan-Timeout: {self.config.get('SCAN', 'scan_timeout', fallback='300')} Sekunden")
+            print(f"3. Max. parallele Scans: {self.config.get('SCAN', 'max_parallel_scans', fallback='5')}")
 
             print(f"\n{Color.YELLOW}Datenbank-Einstellungen:{Color.RESET}")
-            print(f"4. Datenbankname: {config.get('DATABASE', 'db_name', fallback='iot_devices.db')}")
-            print(f"5. Backup aktiviert: {config.get('DATABASE', 'backup_enabled', fallback='true')}")
-            print(f"6. Backup-Intervall: {config.get('DATABASE', 'backup_interval', fallback='86400')} Sekunden")
+            print(f"4. Datenbankname: {self.config.get('DATABASE', 'db_name', fallback='iot_devices.db')}")
+            print(f"5. Backup aktiviert: {self.config.get('DATABASE', 'backup_enabled', fallback='true')}")
+            print(f"6. Backup-Intervall: {self.config.get('DATABASE', 'backup_interval', fallback='86400')} Sekunden")
 
             print(f"\n{Color.YELLOW}API-Einstellungen:{Color.RESET}")
             print(f"7. MAC API Key: {'*' * len(self.mac_api_key)}")
 
             print(f"\n{Color.YELLOW}Logging-Einstellungen:{Color.RESET}")
-            print(f"8. Log-Datei: {config.get('LOGGING', 'log_file', fallback='iot_scanner.log')}")
-            print(f"9. Log-Level: {config.get('LOGGING', 'log_level', fallback='INFO')}")
+            print(f"8. Log-Datei: {self.config.get('LOGGING', 'log_file', fallback='iot_scanner.log')}")
+            print(f"9. Log-Level: {self.config.get('LOGGING', 'log_level', fallback='INFO')}")
 
             print(f"\n{Color.YELLOW}Export-Einstellungen:{Color.RESET}")
-            print(f"10. Export-Pfad: {config.get('EXPORT', 'export_path', fallback='exports')}")
-            print(f"11. Standard-Format: {config.get('EXPORT', 'default_format', fallback='all')}")
+            print(f"10. Export-Pfad: {self.config.get('EXPORT', 'export_path', fallback='exports')}")
+            print(f"11. Standard-Format: {self.config.get('EXPORT', 'default_format', fallback='all')}")
 
             print("\n12. Zurück zum Hauptmenü")
 
@@ -907,50 +973,72 @@ class IOTScanner:
                 if choice == "1":
                     new_value = input("Neues Standard-Netzwerk (z.B. 192.168.0.0/24): ")
                     if new_value:
-                        config['SCAN']['default_network'] = new_value
+                        if 'SCAN' not in self.config:
+                            self.config['SCAN'] = {}
+                        self.config['SCAN']['default_network'] = new_value
                         self.default_network = new_value
                 elif choice == "2":
                     new_value = input("Neuer Scan-Timeout (in Sekunden): ")
                     if new_value.isdigit():
-                        config['SCAN']['scan_timeout'] = new_value
+                        if 'SCAN' not in self.config:
+                            self.config['SCAN'] = {}
+                        self.config['SCAN']['scan_timeout'] = new_value
                 elif choice == "3":
                     new_value = input("Neue maximale Anzahl paralleler Scans: ")
                     if new_value.isdigit():
-                        config['SCAN']['max_parallel_scans'] = new_value
+                        if 'SCAN' not in self.config:
+                            self.config['SCAN'] = {}
+                        self.config['SCAN']['max_parallel_scans'] = new_value
                 elif choice == "4":
                     print(f"{Color.YELLOW}Hinweis: Änderung der Datenbank erfordert Neustart{Color.RESET}")
                     new_value = input("Neuer Datenbankname: ")
                     if new_value:
-                        config['DATABASE']['db_name'] = new_value
+                        if 'DATABASE' not in self.config:
+                            self.config['DATABASE'] = {}
+                        self.config['DATABASE']['db_name'] = new_value
                 elif choice == "5":
                     new_value = input("Backup aktivieren? (true/false): ")
                     if new_value.lower() in ['true', 'false']:
-                        config['DATABASE']['backup_enabled'] = new_value
+                        if 'DATABASE' not in self.config:
+                            self.config['DATABASE'] = {}
+                        self.config['DATABASE']['backup_enabled'] = new_value
                 elif choice == "6":
                     new_value = input("Neues Backup-Intervall (in Sekunden): ")
                     if new_value.isdigit():
-                        config['DATABASE']['backup_interval'] = new_value
+                        if 'DATABASE' not in self.config:
+                            self.config['DATABASE'] = {}
+                        self.config['DATABASE']['backup_interval'] = new_value
                 elif choice == "7":
                     new_value = input("Neuer MAC API Key: ")
                     if new_value:
-                        config['API']['mac_api_key'] = new_value
+                        if 'API' not in self.config:
+                            self.config['API'] = {}
+                        self.config['API']['mac_api_key'] = new_value
                         self.mac_api_key = new_value
                 elif choice == "8":
                     new_value = input("Neue Log-Datei: ")
                     if new_value:
-                        config['LOGGING']['log_file'] = new_value
+                        if 'LOGGING' not in self.config:
+                            self.config['LOGGING'] = {}
+                        self.config['LOGGING']['log_file'] = new_value
                 elif choice == "9":
                     new_value = input("Neues Log-Level (DEBUG/INFO/WARNING/ERROR/CRITICAL): ")
                     if new_value in ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']:
-                        config['LOGGING']['log_level'] = new_value
+                        if 'LOGGING' not in self.config:
+                            self.config['LOGGING'] = {}
+                        self.config['LOGGING']['log_level'] = new_value
                 elif choice == "10":
                     new_value = input("Neuer Export-Pfad: ")
                     if new_value:
-                        config['EXPORT']['export_path'] = new_value
+                        if 'EXPORT' not in self.config:
+                            self.config['EXPORT'] = {}
+                        self.config['EXPORT']['export_path'] = new_value
                 elif choice == "11":
                     new_value = input("Neues Standard-Format (csv/json/html/all): ")
                     if new_value in ['csv', 'json', 'html', 'all']:
-                        config['EXPORT']['default_format'] = new_value
+                        if 'EXPORT' not in self.config:
+                            self.config['EXPORT'] = {}
+                        self.config['EXPORT']['default_format'] = new_value
                 elif choice == "12":
                     break
                 else:
@@ -966,8 +1054,8 @@ class IOTScanner:
     # Konfiguration speichern
     def _save_config(self):
         try:
-            with open('iot_config.ini', 'w') as configfile:
-                config.write(configfile)
+            with open('iot_config2.ini', 'w') as configfile:
+                self.config.write(configfile)
             print(f"{Color.GREEN}Einstellungen wurden gespeichert.{Color.RESET}")
         except Exception as e:
             logging.error(f"Fehler beim Speichern der Konfiguration: {str(e)}")
