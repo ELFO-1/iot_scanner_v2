@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 # -*- coding: utf-8 -*-
 #
 ##################################
@@ -68,7 +68,6 @@ BANNER_TEXT = r"""
 # Hauptklasse für den IoT-Scanner
 class IOTScanner:
     def __init__(self):
-        """Initialisierung des Scanners mit grundlegenden Objekten und Konfigurationen"""
         self.nm = nmap.PortScanner()   # Nmap-Scanner-Objekt
         self.mac_api_key = config['API']['mac_api_key']   # API-Schlüssel für MAC-Adressen-Abfrage
         self.db_name = config['DATABASE']['db_name']     # Name der SQLite-Datenbank
@@ -170,7 +169,7 @@ class IOTScanner:
         conn = sqlite3.connect(self.db_name)  # Verbindung zur SQLite-Datenbank
         c = conn.cursor()
 
-        c.execute('''CREATE TABLE IF NOT EXISTS devices     # Erstellen der Geräte-Tabelle
+        c.execute('''CREATE TABLE IF NOT EXISTS devices    
                     (id INTEGER PRIMARY KEY AUTOINCREMENT,
                      ip TEXT,
                      mac TEXT,
@@ -187,7 +186,7 @@ class IOTScanner:
                      scan_duration REAL,
                      status TEXT)''')
 
-        c.execute('''CREATE TABLE IF NOT EXISTS scan_history    # Erstellen der Scan-Historie-Tabelle
+        c.execute('''CREATE TABLE IF NOT EXISTS scan_history   
                     (id INTEGER PRIMARY KEY AUTOINCREMENT,
                      scan_date TEXT,
                      scan_type TEXT,
