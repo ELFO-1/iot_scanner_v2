@@ -82,10 +82,29 @@ Menüoptionen
 
 Exportformate
 
-    CSV: Tabellarische Daten
-    JSON: Strukturierte Daten
-    HTML: Formatierte Webseite mit Tabelle
+    Strukturierte Verzeichnisorganisation mit Zeitstempel
+Detaillierten HTML-Report mit:
 
+    Übersichtlicher Formatierung
+    Statistiken
+    Tabellarische Darstellung der Geräte und Scan-Historie
+
+Zusammenfassungs-TXT-Datei mit:
+
+    Grundlegenden Statistiken
+    Häufigsten Herstellern
+    Letzten 5 Scans
+
+Export in mehreren Formaten:
+
+    CSV (getrennt für Geräte und Scan-Historie)
+    JSON (getrennt für Geräte und Scan-Historie)
+    HTML (detaillierter Report)
+    TXT (Zusammenfassung)
+
+Automatische ZIP-Archivierung aller Exports
+Verbesserte Fehlerbehandlung
+Detaillierte Konsolenausgabe mit Statistiken
 Logging
 
     Log-Datei: iot_scanner.log
