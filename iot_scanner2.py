@@ -25,6 +25,7 @@ from typing import List, Dict, Optional  # Typ-Hints für bessere Code-Lesbarkei
 import sys  # Systemoperationen
 import threading  # Multithreading-Unterstützung
 from concurrent.futures import ThreadPoolExecutor  # Parallele Ausführung
+import zipfile
 
 # Konfiguration aus ini-Datei laden
 config = configparser.ConfigParser()
@@ -519,50 +520,214 @@ class IOTScanner:
 
     # Ergebnisse exportieren
     def export_results(self):
-        if not os.path.exists('exports'):
-            os.makedirs('exports')
+        try:
+            # Erstelle Export-Verzeichnis falls nicht vorhanden
+            export_dir = 'exports'
+            if not os.path.exists(export_dir):
+                os.makedirs(export_dir)
+                print(f"{Color.GREEN}Export-Verzeichnis erstellt: {export_dir}{Color.RESET}")
 
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        base_filename = f'iot_scan_report_{timestamp}'
+            # Erstelle Unterverzeichnis mit Zeitstempel
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            report_dir = os.path.join(export_dir, f'scan_report_{timestamp}')
+            os.makedirs(report_dir)
+            print(f"{Color.GREEN}Report-Verzeichnis erstellt: {report_dir}{Color.RESET}")
 
-        conn = sqlite3.connect(self.db_name)
-        df = pd.read_sql_query("SELECT * FROM devices", conn)
+            # Verbindung zur Datenbank
+            conn = sqlite3.connect(self.db_name)
 
-        # CSV Export
-        csv_file = f'exports/{base_filename}.csv'
-        df.to_csv(csv_file, index=False)
+            # Hole die tatsächlichen Spaltennamen aus der Datenbank
+            cursor = conn.cursor()
+            cursor.execute("PRAGMA table_info(devices)")
+            device_columns = [column[1] for column in cursor.fetchall()]
 
-        # JSON Export
-        json_file = f'exports/{base_filename}.json'
-        df.to_json(json_file, orient='records', indent=4)
+            # Geräte-Informationen mit den tatsächlichen Spalten
+            devices_query = f"SELECT {', '.join(device_columns)} FROM devices"
+            devices_df = pd.read_sql_query(devices_query, conn)
 
-        # HTML Export
-        html_content = """
-        <html>
-        <head>
-            <style>
-                body { font-family: Arial, sans-serif; }
-                table { border-collapse: collapse; width: 100%; }
-                th, td { padding: 8px; text-align: left; border: 1px solid #ddd; }
-                th { background-color: #4CAF50; color: white; }
-                tr:nth-child(even) { background-color: #f2f2f2; }
-            </style>
-        </head>
-        <body>
-        """
-        html_content += df.to_html(classes='dataframe')
-        html_content += "</body></html>"
+            # Scan-Historie
+            history_df = pd.read_sql_query("""
+                SELECT
+                    scan_date, scan_type, network_range,
+                    devices_found, duration, status
+                FROM scan_history
+                ORDER BY scan_date DESC
+            """, conn)
 
-        html_file = f'exports/{base_filename}.html'
-        with open(html_file, 'w') as f:
-            f.write(html_content)
+            # CSV Export
+            devices_csv = os.path.join(report_dir, 'devices.csv')
+            history_csv = os.path.join(report_dir, 'scan_history.csv')
+            devices_df.to_csv(devices_csv, index=False)
+            history_df.to_csv(history_csv, index=False)
 
-        print(f"\n{Color.GREEN}Berichte wurden exportiert:{Color.RESET}")
-        print(f"CSV: {csv_file}")
-        print(f"JSON: {json_file}")
-        print(f"HTML: {html_file}")
+            # JSON Export
+            devices_json = os.path.join(report_dir, 'devices.json')
+            history_json = os.path.join(report_dir, 'scan_history.json')
+            devices_df.to_json(devices_json, orient='records', indent=4)
+            history_df.to_json(history_json, orient='records', indent=4)
 
-        conn.close()
+            # Erstelle detaillierten HTML-Report
+            html_report = os.path.join(report_dir, 'detailed_report.html')
+
+            html_content = f"""
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <meta charset="UTF-8">
+                <title>IoT Scanner Report - {timestamp}</title>
+                <style>
+                    body {{
+                        font-family: Arial, sans-serif;
+                        margin: 20px;
+                        background-color: #f5f5f5;
+                    }}
+                    .container {{
+                        max-width: 1200px;
+                        margin: 0 auto;
+                        background-color: white;
+                        padding: 20px;
+                        border-radius: 8px;
+                        box-shadow: 0 0 10px rgba(0,0,0,0.1);
+                    }}
+                    h1, h2 {{
+                        color: #2c3e50;
+                        border-bottom: 2px solid #3498db;
+                        padding-bottom: 10px;
+                    }}
+                    .summary-box {{
+                        background-color: #f8f9fa;
+                        border: 1px solid #dee2e6;
+                        border-radius: 4px;
+                        padding: 15px;
+                        margin: 10px 0;
+                    }}
+                    table {{
+                        width: 100%;
+                        border-collapse: collapse;
+                        margin: 15px 0;
+                    }}
+                    th, td {{
+                        border: 1px solid #dee2e6;
+                        padding: 8px;
+                        text-align: left;
+                    }}
+                    th {{
+                        background-color: #3498db;
+                        color: white;
+                    }}
+                    tr:nth-child(even) {{
+                        background-color: #f8f9fa;
+                    }}
+                    .stats {{
+                        display: grid;
+                        grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+                        gap: 15px;
+                        margin: 20px 0;
+                    }}
+                    .stat-card {{
+                        background-color: #fff;
+                        border: 1px solid #dee2e6;
+                        border-radius: 4px;
+                        padding: 15px;
+                        text-align: center;
+                    }}
+                </style>
+            </head>
+            <body>
+                <div class="container">
+                    <h1>IoT Netzwerk Scanner Report</h1>
+                    <p>Erstellt am: {datetime.now().strftime("%d.%m.%Y %H:%M:%S")}</p>
+
+                    <div class="summary-box">
+                        <h2>Zusammenfassung</h2>
+                        <div class="stats">
+                            <div class="stat-card">
+                                <h3>Gefundene Geräte</h3>
+                                <p>{len(devices_df)}</p>
+                            </div>
+                            <div class="stat-card">
+                                <h3>Durchgeführte Scans</h3>
+                                <p>{len(history_df)}</p>
+                            </div>
+                            <div class="stat-card">
+                                <h3>Unique MAC-Adressen</h3>
+                                <p>{devices_df['mac'].nunique() if 'mac' in devices_df.columns else 0}</p>
+                            </div>
+                        </div>
+                    </div>
+
+                    <h2>Gefundene Geräte</h2>
+                    {devices_df.to_html(classes='dataframe', index=False)}
+
+                    <h2>Scan-Historie</h2>
+                    {history_df.to_html(classes='dataframe', index=False)}
+                </div>
+            </body>
+            </html>
+            """
+
+            with open(html_report, 'w', encoding='utf-8') as f:
+                f.write(html_content)
+
+            # Erstelle Zusammenfassungs-TXT
+            summary_txt = os.path.join(report_dir, 'summary.txt')
+            with open(summary_txt, 'w', encoding='utf-8') as f:
+                f.write("IoT Netzwerk Scanner - Zusammenfassung\n")
+                f.write("=" * 50 + "\n\n")
+                f.write(f"Erstellungsdatum: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}\n\n")
+
+                f.write("Statistiken:\n")
+                f.write("-" * 20 + "\n")
+                f.write(f"Gefundene Geräte: {len(devices_df)}\n")
+                f.write(f"Durchgeführte Scans: {len(history_df)}\n")
+                if 'mac' in devices_df.columns:
+                    f.write(f"Unique MAC-Adressen: {devices_df['mac'].nunique()}\n\n")
+
+                if 'mac' in devices_df.columns:
+                    f.write("MAC-Adressen Statistik:\n")
+                    f.write("-" * 20 + "\n")
+                    mac_stats = devices_df['mac'].value_counts().head()
+                    for mac, count in mac_stats.items():
+                        f.write(f"{mac}: {count}\n")
+
+                f.write("\nScan-Historie (letzte 5 Scans):\n")
+                f.write("-" * 20 + "\n")
+                for _, scan in history_df.head().iterrows():
+                    f.write(f"Datum: {scan['scan_date']}\n")
+                    f.write(f"Typ: {scan['scan_type']}\n")
+                    f.write(f"Gefundene Geräte: {scan['devices_found']}\n")
+                    f.write(f"Dauer: {scan['duration']:.2f} Sekunden\n")
+                    f.write("-" * 20 + "\n")
+
+            # Erstelle ZIP-Archiv
+            zip_file = os.path.join(export_dir, f'scan_report_{timestamp}.zip')
+            with zipfile.ZipFile(zip_file, 'w') as zipf:
+                for root, _, files in os.walk(report_dir):
+                    for file in files:
+                        file_path = os.path.join(root, file)
+                        arcname = os.path.relpath(file_path, report_dir)
+                        zipf.write(file_path, arcname)
+
+            print(f"\n{Color.GREEN}Export erfolgreich abgeschlossen!{Color.RESET}")
+            print(f"\nExportierte Dateien in {report_dir}:")
+            print(f"- CSV: devices.csv, scan_history.csv")
+            print(f"- JSON: devices.json, scan_history.json")
+            print(f"- HTML: detailed_report.html")
+            print(f"- TXT: summary.txt")
+            print(f"\nZIP-Archiv erstellt: {zip_file}")
+
+            # Statistiken anzeigen
+            print(f"\n{Color.YELLOW}Scan-Statistiken:{Color.RESET}")
+            print(f"Gefundene Geräte: {len(devices_df)}")
+            print(f"Durchgeführte Scans: {len(history_df)}")
+            if 'mac' in devices_df.columns:
+                print(f"Unique MAC-Adressen: {devices_df['mac'].nunique()}")
+
+            conn.close()
+
+        except Exception as e:
+            logging.error(f"Fehler beim Export der Ergebnisse: {str(e)}")
+            print(f"{Color.RED}Fehler beim Export: {str(e)}{Color.RESET}")
 
     # Scan-Profile verwalten
     def manage_scan_profiles(self):
