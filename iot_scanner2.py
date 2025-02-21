@@ -29,11 +29,11 @@ import zipfile
 
 # Konfiguration aus ini-Datei laden
 config = configparser.ConfigParser()
-config.read('iot_config.ini')       # Einlesen der Konfigurationsdatei
+config.read('iot_config2.ini')       # Einlesen der Konfigurationsdatei
 
 # Logging konfigurieren für Fehler- und Ereignisprotokollierung
 logging.basicConfig(
-    filename='iot_scanner.log',
+    filename='iot_scanner2.log',
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
