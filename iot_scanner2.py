@@ -258,13 +258,13 @@ class IOTScanner:
 
     # Fortschrittsanzeige für laufende Scans
     def show_progress(self):
-        chars = "|/-\\"
+        animation = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
         i = 0
         while self.scanning:
-            sys.stdout.write(f'\rScanning... {chars[i]}')
+            sys.stdout.write(f'\r{Color.CYAN}[{animation[i]}] Scanning... {Color.RESET}')
             sys.stdout.flush()
             time.sleep(0.1)
-            i = (i + 1) % len(chars)
+            i = (i + 1) % len(animation)
 
     # Geräte identifizieren
     def identify_devices(self, devices: List[Dict]):
@@ -363,26 +363,66 @@ class IOTScanner:
         if not device_info:
             return
 
-        print("\n" + "=" * 60)
-        print(f"{Color.CYAN}Geräteinformationen:{Color.RESET}")
-        print("=" * 60)
+        print("\n" + "═" * 80)
+        print(f"{Color.CYAN}║ GERÄTEINFORMATIONEN{Color.RESET}")
+        print("═" * 80)
 
-        print(f"\n{Color.YELLOW}Basis-Informationen:{Color.RESET}")
-        print(f"IP-Adresse: {device_info['ip']}")
-        print(f"MAC-Adresse: {device_info['mac']}")
-        print(f"Hersteller: {device_info['manufacturer']}")
+        # Basis-Informationen Block
+        print(f"\n{Color.YELLOW}▶ BASIS-INFORMATIONEN{Color.RESET}")
+        print("┌" + "─" * 78 + "┐")
+        print(f"│ IP-Adresse:  {device_info['ip']:<67} │")
+        print(f"│ MAC-Adresse: {device_info['mac']:<67} │")
+        print(f"│ Hersteller:  {device_info['manufacturer']:<67} │")
+        print("└" + "─" * 78 + "┘")
 
+        # Betriebssystem Block
         if device_info.get('os'):
-            print(f"\n{Color.YELLOW}Betriebssystem:{Color.RESET}")
-            print(f"Name: {device_info['os'].get('name', 'Unbekannt')}")
-            print(f"Genauigkeit: {device_info['os'].get('accuracy', 'N/A')}%")
+            print(f"\n{Color.YELLOW}▶ BETRIEBSSYSTEM{Color.RESET}")
+            print("┌" + "─" * 78 + "┐")
+            print(f"│ Name:       {device_info['os'].get('name', 'Unbekannt'):<67} │")
+            print(f"│ Genauigkeit: {device_info['os'].get('accuracy', 'N/A')}%{' ' * 65} │")
+            print("└" + "─" * 78 + "┘")
 
+        # Ports und Dienste Block
         if device_info.get('ports'):
-            print(f"\n{Color.YELLOW}Offene Ports und Dienste:{Color.RESET}")
+            print(f"\n{Color.YELLOW}▶ OFFENE PORTS UND DIENSTE{Color.RESET}")
+            print("┌" + "─" * 78 + "┐")
             for port in device_info['ports']:
-                print(f"\nPort {port['number']}/{port['protocol']}:")
-                print(f"  Service: {port.get('service', 'Unbekannt')}")
-                print(f"  Version: {port.get('version', 'Unbekannt')}")
+                print(f"│ Port {port['number']}/{port['protocol']}:")
+                print(f"│   • Service: {port.get('service', 'Unbekannt'):<63} │")
+                print(f"│   • Version: {port.get('version', 'Unbekannt'):<63} │")
+                print("│" + "─" * 78 + "│")
+            print("└" + "─" * 78 + "┘")
+
+    def print_scan_results(self, devices: List[Dict]):
+        print("\n" + "═" * 80)
+        print(f"{Color.GREEN}║ SCAN-ERGEBNISSE{Color.RESET}")
+        print("═" * 80)
+
+        for device in devices:
+            print("\n" + "─" * 80)
+            print(f"{Color.CYAN}▶ GERÄT GEFUNDEN{Color.RESET}")
+            print("┌" + "─" * 78 + "┐")
+            print(f"│ IP:        {device['ip']:<67} │")
+            print(f"│ MAC:       {device['mac']:<67} │")
+            print(f"│ Status:    {device['status']:<67} │")
+            print(f"│ Hostname:  {device['hostname']:<67} │")
+            print(f"│ Hersteller: {device['manufacturer']:<66} │")
+            print("└" + "─" * 78 + "┘")
+
+    def print_vulnerability_results(self, ip: str, vulnerabilities: Dict):
+        print("\n" + "═" * 80)
+        print(f"{Color.RED}║ SCHWACHSTELLENANALYSE FÜR {ip}{Color.RESET}")
+        print("═" * 80)
+
+        for port, vulns in vulnerabilities.items():
+            print(f"\n{Color.YELLOW}▶ Port {port}{Color.RESET}")
+            print("┌" + "─" * 78 + "┐")
+            for vuln_name, vuln_details in vulns.items():
+                print(f"│ Schwachstelle: {vuln_name:<65} │")
+                print(f"│ Details: {vuln_details:<69} │")
+                print("│" + "─" * 78 + "│")
+            print("└" + "─" * 78 + "┘")
 
     # Hersteller für MAC-Adresse abrufen
     def get_manufacturer(self, mac):
@@ -449,16 +489,33 @@ class IOTScanner:
 
     # Kompletten Scan durchführen
     def complete_scan(self):
-        print(f"{Color.GREEN}Starte kompletten Scan...{Color.RESET}")
-        self.current_network = input(
-            f"{Color.YELLOW}Netzwerkbereich (Enter für Standard): {Color.RESET}") or self.default_network
+        try:
+            print(f"{Color.GREEN}Starte kompletten Scan...{Color.RESET}")
+            self.current_network = input(
+                f"{Color.YELLOW}Netzwerkbereich (Enter für Standard): {Color.RESET}") or self.default_network
 
-        devices = self.scan_network(self.current_network)
-        if devices:
-            self.identify_devices(devices)
-            self.scan_vulnerabilities()
+            devices = self.scan_network(self.current_network)
+            if devices:
+                self.identify_devices(devices)
+                self.scan_vulnerabilities()
 
-        print(f"\n{Color.GREEN}Kompletter Scan abgeschlossen.{Color.RESET}")
+            print(f"\n{Color.GREEN}Kompletter Scan abgeschlossen.{Color.RESET}")
+
+            # Kurze Pause einfügen
+            time.sleep(1)
+
+            # Input-Stream leeren
+            import sys, termios, tty, os
+            if os.name == 'posix':  # Für Unix-basierte Systeme
+                termios.tcflush(sys.stdin, termios.TCIOFLUSH)
+            else:  # Für Windows
+                import msvcrt
+                while msvcrt.kbhit():
+                    msvcrt.getch()
+
+        except Exception as e:
+            logging.error(f"Fehler beim kompletten Scan: {str(e)}")
+            print(f"{Color.RED}Fehler beim Scan: {str(e)}{Color.RESET}")
 
     # Ergebnisse exportieren
     def export_results(self):
@@ -640,14 +697,13 @@ class IOTScanner:
 
             print(f"\n{Color.GREEN}Letzte 10 Scans:{Color.RESET}")
             print("\n" + "=" * 80)
+            print(
+                f"{Color.YELLOW}{'Datum':<20} | {'Scan-Typ':<20} | {'Netzwerkbereich':<20} | {'Geräte':<8} | {'Dauer (s)':<10} | {'Status':<10}{Color.RESET}")  # Tabellenkopf
+            print("-" * 80)
             for scan in history:
-                print(f"\nDatum: {scan[0]}")
-                print(f"Scan-Typ: {scan[1]}")
-                print(f"Netzwerkbereich: {scan[2]}")
-                print(f"Gefundene Geräte: {scan[3]}")
-                print(f"Dauer: {scan[4]:.2f} Sekunden")
-                print(f"Status: {scan[5]}")
-                print("-" * 80)
+                print(
+                    f"{scan[0]:<20} | {scan[1]:<20} | {scan[2]:<20} | {scan[3]:<8} | {scan[4]:<10.2f} | {scan[5]:<10}")  # Formatierte Ausgabe
+            print("=" * 80)
 
         except Exception as e:
             logging.error(f"Fehler beim Anzeigen der Scan-Historie: {str(e)}")
