@@ -31,6 +31,9 @@ MacOS: brew install nmap
 
 ## Konfiguration
 
+Die config wird automatisch erstellt falls nicht vorhanden . API KEY z.b von https://macaddress.io MUSS EINGETRAGEN WERDEN unter Einstellungen menüpunkt 9
+
+
 iot_config2.ini anpassen:
 [API]
 mac_api_key = IHR_API_SCHLÜSSEL
