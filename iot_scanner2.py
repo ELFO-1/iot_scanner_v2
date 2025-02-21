@@ -122,7 +122,7 @@ class IOTScanner:
 
         # Netzwerkbereich eingeben
         network_range = input(
-            f"{Color.YELLOW}Netzwerkbereich (Enter für Standard): {Color.RESET}") or self.default_network
+            f"{Color.YELLOW}Gib den Netzwerkbereich ein (z.b 192.168.0.1-20 oder Einzel IP (Enter für Standard (192.168.0.0/24)): {Color.RESET}") or self.default_network
 
         # Scan durchführen
         print(f"\n{Color.GREEN}Starte Scan mit Profil '{profile_name}'...{Color.RESET}")
@@ -493,7 +493,7 @@ class IOTScanner:
         try:
             print(f"{Color.GREEN}Starte kompletten Scan...{Color.RESET}")
             self.current_network = input(
-                f"{Color.YELLOW}Netzwerkbereich (Enter für Standard): {Color.RESET}") or self.default_network
+                f"{Color.YELLOW}Gib den Netzwerkbereich ein (z.b 192.168.0.1-20 oder Einzel IP (Enter für Standard (192.168.0.0/24)): {Color.RESET}") or self.default_network
 
             devices = self.scan_network(self.current_network)
             if devices:
