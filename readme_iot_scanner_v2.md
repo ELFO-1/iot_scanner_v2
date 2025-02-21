@@ -95,7 +95,6 @@ Diese Version enthält:
 3. Erhalt der ursprünglichen Struktur und Funktionalität
 4. Klare Dokumentation der Funktionen und Anforderungen
 
-Du kannst die Kommentare und README nach Bedarf anpassen oder erweitern. Soll ich bestimmte Abschnitte noch detaillierter kommentieren?
 
 Autor
 ELFO
