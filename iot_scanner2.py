@@ -124,6 +124,20 @@ class IOTScanner:
 
         return config
 
+    # Führe diesen Code einmalig aus, um bestehende fehlerhafte Einträge zu korrigieren
+    def cleanup_database(self):
+        conn = sqlite3.connect(self.db_name)
+        c = conn.cursor()
+
+        # Setze leere Strings auf Standard-JSON
+        c.execute("UPDATE devices SET vulnerabilities='{}' WHERE TRIM(vulnerabilities)=''")
+
+        # Korrigiere ungültige 'None'-Einträge
+        c.execute("UPDATE devices SET vulnerabilities='{}' WHERE vulnerabilities='None'")
+
+        conn.commit()
+        conn.close()
+
     def __init__(self):
         try:
             # Zuerst Konfiguration überprüfen und laden
@@ -233,10 +247,11 @@ class IOTScanner:
 
     # Datenbank initialisieren
     def setup_database(self):
-        conn = sqlite3.connect(self.db_name)  # Verbindung zur SQLite-Datenbank
+        conn = sqlite3.connect(self.db_name)
         c = conn.cursor()
 
-        c.execute('''CREATE TABLE IF NOT EXISTS devices    
+        # Existierende Tabelle prüfen und Spalten hinzufügen falls notwendig
+        c.execute('''CREATE TABLE IF NOT EXISTS devices
                     (id INTEGER PRIMARY KEY AUTOINCREMENT,
                      ip TEXT,
                      mac TEXT,
@@ -252,6 +267,18 @@ class IOTScanner:
                      scan_profile TEXT,
                      scan_duration REAL,
                      status TEXT)''')
+
+        # Überprüfe vorhandene Spalten
+        c.execute("PRAGMA table_info(devices)")
+        columns = [column[1] for column in c.fetchall()]
+
+        # Fehlende Spalten hinzufügen
+        if 'device_type' not in columns:
+            c.execute("ALTER TABLE devices ADD COLUMN device_type TEXT")
+        if 'open_ports' not in columns:
+            c.execute("ALTER TABLE devices ADD COLUMN open_ports TEXT")
+        if 'vulnerabilities' not in columns:
+            c.execute("ALTER TABLE devices ADD COLUMN vulnerabilities TEXT")
 
         c.execute('''CREATE TABLE IF NOT EXISTS scan_history   
                     (id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -274,7 +301,7 @@ class IOTScanner:
         scan_start = time.time()
 
         try:
-            self.scanning = True   # Scannen aktivieren
+            self.scanning = True
             progress_thread = threading.Thread(target=self.show_progress)
             progress_thread.daemon = True
             progress_thread.start()
@@ -282,10 +309,22 @@ class IOTScanner:
             self.nm.scan(hosts=network_range, arguments='-sn -PE')
 
             self.scanning = False
-            progress_thread.join(timeout=1)
+            if progress_thread.is_alive():
+                progress_thread.join(timeout=1)
+
+            # Input-Stream nach Scan leeren (plattformabhängig)
+            import sys
+            if os.name == 'posix':
+                import termios
+                termios.tcflush(sys.stdin, termios.TCIOFLUSH)
+            else:
+                import msvcrt
+                while msvcrt.kbhit():
+                    msvcrt.getch()
+
             print("\n")
 
-            devices = []  # Liste für gefundene Geräte
+            devices = []
             for host in self.nm.all_hosts():
                 device_info = {
                     'ip': host,
@@ -301,10 +340,10 @@ class IOTScanner:
 
                 devices.append(device_info)
 
-            scan_duration = time.time() - scan_start   # Scan-Dauer berechnen
+            scan_duration = time.time() - scan_start
             self.save_scan_history('network_scan', network_range, len(devices), scan_duration)
 
-            if devices:       # Gefundene Geräte anzeigen
+            if devices:
                 print(f"\n{Color.GREEN}Gefundene Geräte:{Color.RESET}")
                 for device in devices:
                     print(f"\nIP: {device['ip']}")
@@ -349,21 +388,43 @@ class IOTScanner:
                 except Exception as e:
                     logging.error(f"Fehler bei der Geräteidentifikation: {str(e)}")
 
+    def determine_device_type(self, services):
+        # Korrigierte Version:
+        common_iot_ports = {80, 443, 8080, 8883}
+        iot_services = {'mqtt', 'http', 'https', 'upnp'}
+
+        # Verwende services statt ports
+        if any(service.get('name', '').lower() in iot_services for service in services):
+            return "IoT Device"
+        # Ports aus den Services extrahieren
+        ports = {service.get('port', 0) for service in services}
+        if any(port in common_iot_ports for port in ports):
+            return "Suspected IoT Device"
+        return "Unknown"
+
     # Einzelnes Gerät identifizieren
     def identify_single_device(self, device: Dict) -> Dict:
         ip = device['ip']
         try:
-            self.nm.scan(ip, arguments='-sS -sV -O --version-intensity 5')
+            self.nm.scan(ip, arguments='-sS -sV -O --script vuln')
+
+            # Variablen für die Geräteinformationen
+            ports = self.get_port_info(ip)
+            services = self.get_service_info(ip)
 
             device_info = {
                 'ip': ip,
-                'mac': device['mac'],
-                'manufacturer': device['manufacturer'],
+                'mac': device.get('mac', 'N/A'),
+                'manufacturer': device.get('manufacturer', 'Unknown'),
                 'os': self.get_os_info(ip),
-                'ports': self.get_port_info(ip),
-                'services': self.get_service_info(ip)
+                'ports': ports,
+                'services': services,
+                'device_type': self.determine_device_type(services),
+                'open_ports': ', '.join([str(port['number']) for port in ports]),
+                'vulnerabilities': self.get_vulnerabilities(ip)
             }
 
+            self.save_device_to_db(device_info)
             return device_info
         except Exception as e:
             logging.error(f"Fehler bei der Identifikation von {ip}: {str(e)}")
@@ -383,6 +444,41 @@ class IOTScanner:
         except Exception as e:
             logging.error(f"Fehler beim Abrufen der OS-Informationen für {ip}: {str(e)}")
         return {'name': 'Unknown', 'accuracy': 'N/A', 'family': 'Unknown'}
+
+    def get_vulnerabilities(self, ip: str) -> Dict:
+        vulnerabilities = {}
+        try:
+            if ip in self.nm.all_hosts():
+                for proto in self.nm[ip].all_protocols():
+                    for port in self.nm[ip][proto].keys():
+                        port_info = self.nm[ip][proto][port]
+
+                        # Sammle alle verfügbaren Informationen
+                        port_vulns = {}
+
+                        # Nmap Script Output
+                        if 'script' in port_info:
+                            for script_name, output in port_info['script'].items():
+                                port_vulns[script_name] = output
+
+                        # CVE-Informationen
+                        if 'cve' in port_info:
+                            for cve_entry in port_info['cve']:
+                                port_vulns[cve_entry['id']] = cve_entry['description']
+
+                        # Service-spezifische Schwachstellen
+                        if 'service' in port_info:
+                            service_info = port_info['service']
+                            if 'cpe' in service_info:
+                                port_vulns['cpe'] = service_info['cpe']
+
+                        if port_vulns:
+                            vulnerabilities[port] = port_vulns
+
+        except Exception as e:
+            logging.error(f"Fehler bei der Schwachstellenerkennung: {str(e)}")
+
+        return vulnerabilities or {}  # Immer ein Dict zurückgeben
 
     # Port-Informationen abrufen
     def get_port_info(self, ip: str) -> List[Dict]:
@@ -491,6 +587,75 @@ class IOTScanner:
                 print("│" + "─" * 78 + "│")
             print("└" + "─" * 78 + "┘")
 
+    def save_device_to_db(self, device_info: Dict):
+        try:
+            conn = sqlite3.connect(self.db_name)
+            c = conn.cursor()
+
+            # Überprüfe ob das Gerät bereits existiert
+            c.execute("SELECT ip FROM devices WHERE ip=?", (device_info['ip'],))
+            exists = c.fetchone()
+
+            vuln_data = json.dumps(device_info.get('vulnerabilities', {}))
+
+            if exists:
+                # Update existing entry
+                c.execute('''
+                    UPDATE devices SET
+                        mac=?,
+                        manufacturer=?,
+                        device_type=?,
+                        os_name=?,
+                        os_accuracy=?,
+                        open_ports=?,
+                        services=?,
+                        vulnerabilities=?,
+                        last_seen=?,
+                        status=?
+                    WHERE ip=?
+                ''', (
+                    device_info.get('mac', 'N/A'),
+                    device_info.get('manufacturer', 'Unknown'),
+                    device_info.get('device_type', 'Unknown'),
+                    device_info.get('os', {}).get('name', 'Unknown'),
+                    device_info.get('os', {}).get('accuracy', 'N/A'),
+                    device_info.get('open_ports', 'None'),
+                    json.dumps(device_info.get('services', [])),
+                    vuln_data,
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    'active',
+                    device_info['ip']
+                ))
+            else:
+                # Neuer Eintrag
+                c.execute('''
+                    INSERT INTO devices (
+                        ip, mac, manufacturer, device_type,
+                        os_name, os_accuracy, open_ports,
+                        services, vulnerabilities, last_seen,
+                        first_seen, scan_profile, status
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    device_info['ip'],
+                    device_info.get('mac', 'N/A'),
+                    device_info.get('manufacturer', 'Unknown'),
+                    device_info.get('device_type', 'Unknown'),
+                    device_info.get('os', {}).get('name', 'Unknown'),
+                    device_info.get('os', {}).get('accuracy', 'N/A'),
+                    device_info.get('open_ports', 'None'),
+                    json.dumps(device_info.get('services', [])),
+                    vuln_data,
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    'custom_scan',
+                    'active'
+                ))
+
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logging.error(f"Fehler beim Speichern des Geräts: {str(e)}")
+
     # Hersteller für MAC-Adresse abrufen
     def get_manufacturer(self, mac):
         try:
@@ -561,6 +726,7 @@ class IOTScanner:
             self.current_network = input(
                 f"{Color.YELLOW}Gib den Netzwerkbereich ein (z.b 192.168.0.1-20 oder Einzel IP (Enter für Standard (192.168.0.0/24)): {Color.RESET}") or self.default_network
 
+            # Scan durchführen
             devices = self.scan_network(self.current_network)
             if devices:
                 self.identify_devices(devices)
@@ -568,21 +734,30 @@ class IOTScanner:
 
             print(f"\n{Color.GREEN}Kompletter Scan abgeschlossen.{Color.RESET}")
 
-            # Kurze Pause einfügen
+            # Warte kurz und leere den Input-Buffer
             time.sleep(1)
 
-            # Input-Stream leeren
-            import sys, termios, tty, os
+            # Input-Stream leeren (plattformabhängig)
+            import sys
             if os.name == 'posix':  # Für Unix-basierte Systeme
+                import termios
                 termios.tcflush(sys.stdin, termios.TCIOFLUSH)
             else:  # Für Windows
                 import msvcrt
                 while msvcrt.kbhit():
                     msvcrt.getch()
 
+            # Scanner-Status zurücksetzen
+            self.scanning = False
+
+            # Kurze Pause vor Rückkehr zum Menü
+            time.sleep(0.5)
+
         except Exception as e:
+            self.scanning = False  # Status auch bei Fehler zurücksetzen
             logging.error(f"Fehler beim kompletten Scan: {str(e)}")
             print(f"{Color.RED}Fehler beim Scan: {str(e)}{Color.RESET}")
+
 
     # Ergebnisse exportieren
     def export_results(self):
@@ -602,14 +777,94 @@ class IOTScanner:
             # Verbindung zur Datenbank
             conn = sqlite3.connect(self.db_name)
 
-            # Hole die tatsächlichen Spaltennamen aus der Datenbank
-            cursor = conn.cursor()
-            cursor.execute("PRAGMA table_info(devices)")
-            device_columns = [column[1] for column in cursor.fetchall()]
+            # Geräte-Informationen aus Datenbank lesen
+            devices_query = "SELECT * FROM devices"
+            devices_df = pd.read_sql_query(devices_query, conn)  # WICHTIG: Diese Zeile fehlte
 
-            # Geräte-Informationen mit den tatsächlichen Spalten
-            devices_query = f"SELECT {', '.join(device_columns)} FROM devices"
-            devices_df = pd.read_sql_query(devices_query, conn)
+            # Services-Spalte formatieren
+            if 'services' in devices_df.columns:
+                def format_services(services_json):
+                    try:
+                        services = json.loads(services_json)
+                        formatted = []
+                        for service in services:
+                            parts = []
+                            if service.get('port'):
+                                parts.append(f"Port {service['port']}")
+                            if service.get('name'):
+                                parts.append(service['name'])
+                            if service.get('version'):
+                                parts.append(f"v{service['version']}")
+                            if service.get('extrainfo'):
+                                parts.append(f"[{service['extrainfo']}]")
+                            formatted.append(" • ".join(parts))
+                        return "\n".join(formatted)
+                    except Exception as e:
+                        logging.error(f"Fehler beim Formatieren der Services: {str(e)}")
+                        return "Dienstinformationen nicht verfügbar"
+
+                devices_df['services'] = devices_df['services'].apply(format_services)
+
+            # Konvertiere JSON-Strings zurück zu Listen/Dicts
+
+            # In der export_results()-Methode ersetzen wir den vulnerabilities-Abschnitt:
+
+            if 'vulnerabilities' in devices_df.columns:
+                def load_vulnerabilities(vuln_str):
+                    try:
+                        return json.loads(vuln_str) if vuln_str.strip() else {}
+                    except:
+                        return {}
+
+                devices_df['raw_vulnerabilities'] = devices_df['vulnerabilities'].apply(load_vulnerabilities)
+
+                # Korrigierte Link-Generierung
+                devices_df['vulnerabilities'] = devices_df.apply(
+                    lambda
+                        row: f'<a href="vulners_{row["ip"]}.html" style="color: #dc3545; text-decoration: underline;" target="_blank">🔍 {len(row["raw_vulnerabilities"])} Schwachstellen</a>'
+                    if row['raw_vulnerabilities']
+                    else "Keine Schwachstellen gefunden",
+                    axis=1
+                )
+
+                # Detailseiten-Generierung
+                for index, row in devices_df.iterrows():
+                    vuln_data = row['raw_vulnerabilities']
+                    if vuln_data:
+                        try:
+                            ip = row['ip']
+                            formatted = json.dumps(vuln_data, indent=4)
+
+                            vuln_html = f"""<!DOCTYPE html>
+                                    <html>
+                                    <head>
+                                        <title>Schwachstellen Details - {ip}</title>
+                                        <style>
+                                            body {{ font-family: Arial, sans-serif; margin: 20px }}
+                                            pre {{
+                                                white-space: pre-wrap;
+                                                background: #f8f9fa;
+                                                padding: 15px;
+                                                border-radius: 5px;
+                                                border: 1px solid #ddd;
+                                            }}
+                                        </style>
+                                    </head>
+                                    <body>
+                                        <h2>Schwachstellen Details für {ip}</h2>
+                                        <pre>{formatted}</pre>
+                                    </body>
+                                    </html>"""
+
+                            vuln_file_path = os.path.join(report_dir, f'vulners_{ip}.html')
+                            with open(vuln_file_path, 'w', encoding='utf-8') as f:
+                                f.write(vuln_html)
+                            print(f"{Color.GREEN}Detailseite gespeichert: {vuln_file_path}{Color.RESET}")
+
+                        except Exception as e:
+                            logging.error(f"Fehler bei Detailseite für {ip}: {str(e)}")
+
+                devices_df.drop('raw_vulnerabilities', axis=1, inplace=True)
 
             # Scan-Historie
             history_df = pd.read_sql_query("""
@@ -635,102 +890,131 @@ class IOTScanner:
             # Erstelle detaillierten HTML-Report
             html_report = os.path.join(report_dir, 'detailed_report.html')
 
+            # Generiere devices_html korrekt
+            devices_html = devices_df.to_html(
+                classes='dataframe',
+                index=False,
+                border=0,
+                formatters={
+                    'vulnerabilities': lambda x: f'<div class="vulnerabilities">{x}</div>',
+                    'services': lambda x: f'<div class="services">{x}</div>'
+                },
+                escape=False
+            )
+
             html_content = f"""
-            <!DOCTYPE html>
-            <html>
-            <head>
-                <meta charset="UTF-8">
-                <title>IoT Scanner Report - {timestamp}</title>
-                <style>
-                    body {{
-                        font-family: Arial, sans-serif;
-                        margin: 20px;
-                        background-color: #f5f5f5;
-                    }}
-                    .container {{
-                        max-width: 1200px;
-                        margin: 0 auto;
-                        background-color: white;
-                        padding: 20px;
-                        border-radius: 8px;
-                        box-shadow: 0 0 10px rgba(0,0,0,0.1);
-                    }}
-                    h1, h2 {{
-                        color: #2c3e50;
-                        border-bottom: 2px solid #3498db;
-                        padding-bottom: 10px;
-                    }}
-                    .summary-box {{
-                        background-color: #f8f9fa;
-                        border: 1px solid #dee2e6;
-                        border-radius: 4px;
-                        padding: 15px;
-                        margin: 10px 0;
-                    }}
-                    table {{
-                        width: 100%;
-                        border-collapse: collapse;
-                        margin: 15px 0;
-                    }}
-                    th, td {{
-                        border: 1px solid #dee2e6;
-                        padding: 8px;
-                        text-align: left;
-                    }}
-                    th {{
-                        background-color: #3498db;
-                        color: white;
-                    }}
-                    tr:nth-child(even) {{
-                        background-color: #f8f9fa;
-                    }}
-                    .stats {{
-                        display: grid;
-                        grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-                        gap: 15px;
-                        margin: 20px 0;
-                    }}
-                    .stat-card {{
-                        background-color: #fff;
-                        border: 1px solid #dee2e6;
-                        border-radius: 4px;
-                        padding: 15px;
-                        text-align: center;
-                    }}
-                </style>
-            </head>
-            <body>
-                <div class="container">
-                    <h1>IoT Netzwerk Scanner Report</h1>
-                    <p>Erstellt am: {datetime.now().strftime("%d.%m.%Y %H:%M:%S")}</p>
+                        <!DOCTYPE html>
+                        <html>
+                        <head>
+                            <meta charset="UTF-8">
+                            <title>IoT Scanner Report - {timestamp}</title>
+                            <style>
+                                body {{
+                                    font-family: Arial, sans-serif;
+                                    margin: 20px;
+                                    background-color: #f5f5f5;
+                                }}
+                                .container {{
+                                    max-width: 1200px;
+                                    margin: 0 auto;
+                                    background-color: white;
+                                    padding: 20px;
+                                    border-radius: 8px;
+                                    box-shadow: 0 0 10px rgba(0,0,0,0.1);
+                                }}
+                                td.services {{
+                                    white-space: pre-wrap;
+                                    max-width: 400px;
+                                    line-height: 1.4;
+                                    padding: 8px 12px !important;
+                                }}
+                                .vulnerabilities {{
+                                    max-width: 500px;
+                                    white-space: pre-wrap;
+                                    line-height: 1.4;
+                                    color: #666;
+                                }}
+                                .vulnerabilities:empty::after {{
+                                    content: "Keine Schwachstellen gefunden";
+                                    color: #999;
+                                    font-style: italic;
+                                }}
+                                h1, h2 {{
+                                    color: #2c3e50;
+                                    border-bottom: 2px solid #3498db;
+                                    padding-bottom: 10px;
+                                }}
+                                .summary-box {{
+                                    background-color: #f8f9fa;
+                                    border: 1px solid #dee2e6;
+                                    border-radius: 4px;
+                                    padding: 15px;
+                                    margin: 10px 0;
+                                }}
+                                table {{
+                                    width: 100%;
+                                    border-collapse: collapse;
+                                    margin: 15px 0;
+                                }}
+                                th, td {{
+                                    border: 1px solid #dee2e6;
+                                    padding: 8px;
+                                    text-align: left;
+                                }}
+                                th {{
+                                    background-color: #3498db;
+                                    color: white;
+                                }}
+                                tr:nth-child(even) {{
+                                    background-color: #f8f9fa;
+                                }}
+                                .stats {{
+                                    display: grid;
+                                    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+                                    gap: 15px;
+                                    margin: 20px 0;
+                                }}
+                                .stat-card {{
+                                    background-color: #fff;
+                                    border: 1px solid #dee2e6;
+                                    border-radius: 4px;
+                                    padding: 15px;
+                                    text-align: center;
+                                }}
+                            </style>
+                        </head>
+                        <body>
+                            <div class="container">
+                                <h1>IoT Netzwerk Scanner Report</h1>
+                                <p>Erstellt am: {datetime.now().strftime("%d.%m.%Y %H:%M:%S")}</p>
 
-                    <div class="summary-box">
-                        <h2>Zusammenfassung</h2>
-                        <div class="stats">
-                            <div class="stat-card">
-                                <h3>Gefundene Geräte</h3>
-                                <p>{len(devices_df)}</p>
-                            </div>
-                            <div class="stat-card">
-                                <h3>Durchgeführte Scans</h3>
-                                <p>{len(history_df)}</p>
-                            </div>
-                            <div class="stat-card">
-                                <h3>Unique MAC-Adressen</h3>
-                                <p>{devices_df['mac'].nunique() if 'mac' in devices_df.columns else 0}</p>
-                            </div>
-                        </div>
-                    </div>
+                                <div class="summary-box">
+                                    <h2>Zusammenfassung</h2>
+                                    <div class="stats">
+                                        <div class="stat-card">
+                                            <h3>Gefundene Geräte</h3>
+                                            <p>{len(devices_df)}</p>
+                                        </div>
+                                        <div class="stat-card">
+                                            <h3>Durchgeführte Scans</h3>
+                                            <p>{len(history_df)}</p>
+                                        </div>
+                                        <div class="stat-card">
+                                            <h3>Unique MAC-Adressen</h3>
+                                            <p>{devices_df['mac'].nunique() if 'mac' in devices_df.columns else 0}</p>
+                                        </div>
+                                    </div>
+                                </div>
+                             
+                                <h2>Gefundene Geräte</h2>
+                                {devices_html}
 
-                    <h2>Gefundene Geräte</h2>
-                    {devices_df.to_html(classes='dataframe', index=False)}
-
-                    <h2>Scan-Historie</h2>
-                    {history_df.to_html(classes='dataframe', index=False)}
-                </div>
-            </body>
-            </html>
-            """
+                                <h2>Scan-Historie</h2>
+                                {history_df.to_html(classes='dataframe', index=False)}
+                            </div>
+                        </body>
+                        </html>
+                        """
 
             with open(html_report, 'w', encoding='utf-8') as f:
                 f.write(html_content)
@@ -768,10 +1052,11 @@ class IOTScanner:
             # Erstelle ZIP-Archiv
             zip_file = os.path.join(export_dir, f'scan_report_{timestamp}.zip')
             with zipfile.ZipFile(zip_file, 'w') as zipf:
-                for root, _, files in os.walk(report_dir):
+                for root, _, files in os.walk(export_dir):
                     for file in files:
                         file_path = os.path.join(root, file)
-                        arcname = os.path.relpath(file_path, report_dir)
+                        # Relativer Pfad ab dem Export-Stammverzeichnis
+                        arcname = os.path.relpath(file_path, export_dir)
                         zipf.write(file_path, arcname)
 
             print(f"\n{Color.GREEN}Export erfolgreich abgeschlossen!{Color.RESET}")
@@ -874,39 +1159,28 @@ class IOTScanner:
 
     # laden der Scan-Profile
     def load_scan_profiles(self) -> Dict:
-        try:
-            if os.path.exists('scan_profiles.json'):
-                with open('scan_profiles.json', 'r') as f:
-                    loaded_profiles = json.load(f)
-                logging.info("Scan-Profile wurden geladen")
-                return loaded_profiles
-            else:
-                # Standard-Profile zurückgeben
-                return {
-                    'quick': {
-                        'name': 'Quick Scan',
-                        'args': '-sn -PE -PA21,23,80,3389',
-                        'description': 'Schneller Netzwerk-Discovery Scan'
-                    },
-                    'standard': {
-                        'name': 'Standard Scan',
-                        'args': '-sS -sV -O -p21-23,80,110,135,139,443,445,3389,8080',
-                        'description': 'Standard Scan mit OS-Detection'
-                    },
-                    'deep': {
-                        'name': 'Deep Scan',
-                        'args': '-sS -sV -O -p- --script vuln',
-                        'description': 'Umfassender Scan mit Schwachstellenanalyse'
-                    },
-                    'stealth': {
-                        'name': 'Stealth Scan',
-                        'args': '-sS -T2 -f -p21-23,80,443',
-                        'description': 'Unauffälliger Scan mit fragmentierten Paketen'
-                    }
-                }
-        except Exception as e:
-            logging.error(f"Fehler beim Laden der Scan-Profile: {str(e)}")
-            return {}
+        return {
+            'quick': {
+                'name': 'Quick Scan',
+                'args': '-sn -PE -PA21,23,80,3389',
+                'description': 'Schneller Netzwerk-Discovery Scan'
+            },
+            'standard': {
+                'name': 'Standard Scan',
+                'args': '-sS -sV -O -p21-23,80,110,135,139,443,445,3389,8080',
+                'description': 'Standard Scan mit OS-Detection'
+            },
+            'deep': {
+                'name': 'Deep Scan',
+                'args': '-sS -sV -O -p- --script vulners',
+                'description': 'Umfassender Scan mit Schwachstellenanalyse'
+            },
+            'stealth': {
+                'name': 'Stealth Scan',
+                'args': '-sS -T2 -f -p21-23,80,443',
+                'description': 'Unauffälliger Scan mit fragmentierten Paketen'
+            }
+        }
 
     # Scan-Historie anzeigen
     def show_scan_history(self):
@@ -1125,6 +1399,7 @@ if __name__ == "__main__":
         clear()
         print(BANNER_TEXT)
         scanner = IOTScanner()
+        scanner.cleanup_database()
         scanner.show_menu()
     except KeyboardInterrupt:
         print(f"\n{Color.YELLOW}Programm wurde vom Benutzer beendet.{Color.RESET}")
