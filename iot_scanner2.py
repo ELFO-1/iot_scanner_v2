@@ -1025,7 +1025,16 @@ class IOTScanner:
 
             # Geräte-Informationen aus Datenbank lesen
             devices_query = "SELECT * FROM devices"
-            devices_df = pd.read_sql_query(devices_query, conn)  # WICHTIG: Diese Zeile fehlte
+            devices_df = pd.read_sql_query(devices_query, conn)
+
+            # Scan-Historie HIER laden (vor der Verwendung)
+            history_df = pd.read_sql_query("""
+                SELECT
+                    scan_date, scan_type, network_range,
+                    devices_found, duration, status
+                FROM scan_history
+                ORDER BY scan_date DESC
+            """, conn)
 
             # Services-Spalte formatieren
             if 'services' in devices_df.columns:
@@ -1052,9 +1061,6 @@ class IOTScanner:
                 devices_df['services'] = devices_df['services'].apply(format_services)
 
             # Konvertiere JSON-Strings zurück zu Listen/Dicts
-
-            # In der export_results()-Methode ersetzen wir den vulnerabilities-Abschnitt:
-
             if 'vulnerabilities' in devices_df.columns:
                 def load_vulnerabilities(vuln_str):
                     try:
@@ -1073,297 +1079,292 @@ class IOTScanner:
                     axis=1
                 )
 
-                # Detailseiten-Generierung mit verbesserter Fehlerbehandlung und Darstellung
+                # Detailseiten-Generierung
                 for index, row in devices_df.iterrows():
                     vuln_data = row['raw_vulnerabilities']
-                    try:
-                        ip = row['ip']
+                    if vuln_data:
+                        try:
+                            ip = row['ip']
 
-                        # HTML-Head mit besserer Formatierung
-                        vuln_html = f"""<!DOCTYPE html>
-                        <html lang="de">
-                        <head>
-                            <meta charset="UTF-8">
-                            <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                            <title>Schwachstellenanalyse - {ip}</title>
-                            <style>
-                                body {{
-                                    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-                                    margin: 0;
-                                    padding: 20px;
-                                    background-color: #f5f5f5;
-                                    color: #333;
-                                    line-height: 1.6;
-                                }}
-                                .container {{
-                                    max-width: 1200px;
-                                    margin: 0 auto;
-                                    background-color: white;
-                                    padding: 20px;
-                                    border-radius: 8px;
-                                    box-shadow: 0 0 10px rgba(0,0,0,0.1);
-                                }}
-                                h1, h2, h3, h4 {{
-                                    color: #2c3e50;
-                                    margin-top: 20px;
-                                }}
-                                h1 {{
-                                    border-bottom: 2px solid #3498db;
-                                    padding-bottom: 10px;
-                                    margin-top: 0;
-                                }}
-                                .port-section {{
-                                    margin-bottom: 30px;
-                                    border: 1px solid #ddd;
-                                    border-radius: 5px;
-                                    overflow: hidden;
-                                }}
-                                .port-header {{
-                                    background-color: #3498db;
-                                    color: white;
-                                    padding: 10px 15px;
-                                    font-size: 18px;
-                                    font-weight: bold;
-                                }}
-                                .port-content {{
-                                    padding: 15px;
-                                }}
-                                .vulnerability {{
-                                    margin-bottom: 15px;
-                                    padding: 15px;
-                                    background-color: #f8f9fa;
-                                    border-left: 4px solid #e74c3c;
-                                    border-radius: 0 5px 5px 0;
-                                }}
-                                .vuln-name {{
-                                    font-weight: bold;
-                                    color: #e74c3c;
-                                    margin-bottom: 5px;
-                                    font-size: 16px;
-                                }}
-                                .vuln-description {{
-                                    white-space: pre-wrap;
-                                    margin-top: 10px;
-                                    padding: 10px;
-                                    background-color: #fff;
-                                    border: 1px solid #ddd;
-                                    border-radius: 4px;
-                                    max-height: 400px;
-                                    overflow-y: auto;
-                                }}
-                                .cve {{
-                                    background-color: #ffebee;
-                                    border-left-color: #c0392b;
-                                }}
-                                .cve .vuln-name {{
-                                    color: #c0392b;
-                                }}
-                                .info {{
-                                    border-left-color: #2196f3;
-                                    background-color: #e3f2fd;
-                                }}
-                                .info .vuln-name {{
-                                    color: #2196f3;
-                                }}
-                                .warning {{
-                                    border-left-color: #f39c12;
-                                    background-color: #fff3e0;
-                                }}
-                                .warning .vuln-name {{
-                                    color: #f39c12;
-                                }}
-                                .info-box {{
-                                    background-color: #e3f2fd;
-                                    border: 1px solid #2196f3;
-                                    border-radius: 4px;
-                                    padding: 15px;
-                                    margin-bottom: 20px;
-                                }}
-                                table {{
-                                    width: 100%;
-                                    border-collapse: collapse;
-                                    margin: 15px 0;
-                                }}
-                                th, td {{
-                                    padding: 10px;
-                                    border: 1px solid #ddd;
-                                    text-align: left;
-                                }}
-                                th {{
-                                    background-color: #f2f2f2;
-                                    font-weight: bold;
-                                }}
-                                .no-vulns {{
-                                    color: #666;
-                                    font-style: italic;
-                                    text-align: center;
-                                    padding: 20px;
-                                }}
-                                .summary {{
-                                    margin-bottom: 20px;
-                                    padding: 10px;
-                                    background-color: #f8f9fa;
-                                    border-radius: 4px;
-                                }}
-                                .summary-item {{
-                                    display: inline-block;
-                                    margin-right: 20px;
-                                    padding: 5px 10px;
-                                    background-color: #e9ecef;
-                                    border-radius: 3px;
-                                }}
-                            </style>
-                        </head>
-                        <body>
-                            <div class="container">
-                                <h1>Schwachstellenanalyse für {ip}</h1>
-                                <div class="info-box">
-                                    <strong>IP-Adresse:</strong> {ip}<br>
-                                    <strong>MAC-Adresse:</strong> {row.get('mac', 'N/A')}<br>
-                                    <strong>Hersteller:</strong> {row.get('manufacturer', 'Unbekannt')}<br>
-                                    <strong>Betriebssystem:</strong> {row.get('os_name', 'Unbekannt')}<br>
-                                    <strong>Offene Ports:</strong> {row.get('open_ports', 'Keine')}<br>
-                                    <strong>Scan-Datum:</strong> {row.get('last_seen', datetime.now().strftime("%Y-%m-%d %H:%M:%S"))}<br>
-                                </div>"""
+                            # HTML-Head mit besserer Formatierung
+                            vuln_html = f"""<!DOCTYPE html>
+                            <html lang="de">
+                            <head>
+                                <meta charset="UTF-8">
+                                <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                                <title>Schwachstellenanalyse - {ip}</title>
+                                <style>
+                                    body {{
+                                        font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                                        margin: 0;
+                                        padding: 20px;
+                                        background-color: #f5f5f5;
+                                        color: #333;
+                                        line-height: 1.6;
+                                    }}
+                                    .container {{
+                                        max-width: 1200px;
+                                        margin: 0 auto;
+                                        background-color: white;
+                                        padding: 20px;
+                                        border-radius: 8px;
+                                        box-shadow: 0 0 10px rgba(0,0,0,0.1);
+                                    }}
+                                    h1, h2, h3, h4 {{
+                                        color: #2c3e50;
+                                        margin-top: 20px;
+                                    }}
+                                    h1 {{
+                                        border-bottom: 2px solid #3498db;
+                                        padding-bottom: 10px;
+                                        margin-top: 0;
+                                    }}
+                                    .port-section {{
+                                        margin-bottom: 30px;
+                                        border: 1px solid #ddd;
+                                        border-radius: 5px;
+                                        overflow: hidden;
+                                    }}
+                                    .port-header {{
+                                        background-color: #3498db;
+                                        color: white;
+                                        padding: 10px 15px;
+                                        font-size: 18px;
+                                        font-weight: bold;
+                                    }}
+                                    .port-content {{
+                                        padding: 15px;
+                                    }}
+                                    .vulnerability {{
+                                        margin-bottom: 15px;
+                                        padding: 15px;
+                                        background-color: #f8f9fa;
+                                        border-left: 4px solid #e74c3c;
+                                        border-radius: 0 5px 5px 0;
+                                    }}
+                                    .vuln-name {{
+                                        font-weight: bold;
+                                        color: #e74c3c;
+                                        margin-bottom: 5px;
+                                        font-size: 16px;
+                                    }}
+                                    .vuln-description {{
+                                        white-space: pre-wrap;
+                                        margin-top: 10px;
+                                        padding: 10px;
+                                        background-color: #fff;
+                                        border: 1px solid #ddd;
+                                        border-radius: 4px;
+                                        max-height: 400px;
+                                        overflow-y: auto;
+                                    }}
+                                    .cve {{
+                                        background-color: #ffebee;
+                                        border-left-color: #c0392b;
+                                    }}
+                                    .cve .vuln-name {{
+                                        color: #c0392b;
+                                    }}
+                                    .info {{
+                                        border-left-color: #2196f3;
+                                        background-color: #e3f2fd;
+                                    }}
+                                    .info .vuln-name {{
+                                        color: #2196f3;
+                                    }}
+                                    .warning {{
+                                        border-left-color: #f39c12;
+                                        background-color: #fff3e0;
+                                    }}
+                                    .warning .vuln-name {{
+                                        color: #f39c12;
+                                    }}
+                                    .info-box {{
+                                        background-color: #e3f2fd;
+                                        border: 1px solid #2196f3;
+                                        border-radius: 4px;
+                                        padding: 15px;
+                                        margin-bottom: 20px;
+                                    }}
+                                    table {{
+                                        width: 100%;
+                                        border-collapse: collapse;
+                                        margin: 15px 0;
+                                    }}
+                                    th, td {{
+                                        padding: 10px;
+                                        border: 1px solid #ddd;
+                                        text-align: left;
+                                    }}
+                                    th {{
+                                        background-color: #f2f2f2;
+                                        font-weight: bold;
+                                    }}
+                                    .no-vulns {{
+                                        color: #666;
+                                        font-style: italic;
+                                        text-align: center;
+                                        padding: 20px;
+                                    }}
+                                    .summary {{
+                                        margin-bottom: 20px;
+                                        padding: 10px;
+                                        background-color: #f8f9fa;
+                                        border-radius: 4px;
+                                    }}
+                                    .summary-item {{
+                                        display: inline-block;
+                                        margin-right: 20px;
+                                        padding: 5px 10px;
+                                        background-color: #e9ecef;
+                                        border-radius: 3px;
+                                    }}
+                                </style>
+                            </head>
+                            <body>
+                                <div class="container">
+                                    <h1>Schwachstellenanalyse für {ip}</h1>
+                                    <div class="info-box">
+                                        <strong>IP-Adresse:</strong> {ip}<br>
+                                        <strong>MAC-Adresse:</strong> {row.get('mac', 'N/A')}<br>
+                                        <strong>Hersteller:</strong> {row.get('manufacturer', 'Unbekannt')}<br>
+                                        <strong>Betriebssystem:</strong> {row.get('os_name', 'Unbekannt')}<br>
+                                        <strong>Offene Ports:</strong> {row.get('open_ports', 'Keine')}<br>
+                                        <strong>Scan-Datum:</strong> {row.get('last_seen', datetime.now().strftime("%Y-%m-%d %H:%M:%S"))}<br>
+                                    </div>"""
 
-                        # Zusammenfassung der gefundenen Schwachstellen
-                        if vuln_data:
-                            total_vulns = sum(len(vulns) for vulns in vuln_data.values())
-                            cve_count = sum(1 for port_vulns in vuln_data.values()
-                                            for k in port_vulns.keys() if 'CVE-' in k or k.startswith('CVE-'))
-                            vuln_html += f"""
-                                <div class="summary">
-                                    <div class="summary-item"><strong>Gesamt:</strong> {total_vulns} Schwachstellen</div>
-                                    <div class="summary-item"><strong>CVEs:</strong> {cve_count}</div>
-                                    <div class="summary-item"><strong>Betroffene Ports:</strong> {len(vuln_data)}</div>
-                                </div>"""
-
-                        # Tabellarische Übersicht für schnellen Überblick
-                        if vuln_data:
-                            vuln_html += """
-                                <h2>Übersicht der Schwachstellen</h2>
-                                <table>
-                                    <tr>
-                                        <th>Port</th>
-                                        <th>Schwachstellen</th>
-                                        <th>CVEs</th>
-                                    </tr>"""
-
-                            for port, vulns in vuln_data.items():
-                                cve_count = sum(1 for k in vulns.keys() if 'CVE-' in k or k.startswith('CVE-'))
+                            # Zusammenfassung der gefundenen Schwachstellen
+                            if vuln_data:
+                                total_vulns = sum(len(vulns) for vulns in vuln_data.values())
+                                cve_count = sum(1 for port_vulns in vuln_data.values()
+                                                for k in port_vulns.keys() if 'CVE-' in k or k.startswith('CVE-'))
                                 vuln_html += f"""
-                                    <tr>
-                                        <td>{port}</td>
-                                        <td>{len(vulns)}</td>
-                                        <td>{cve_count}</td>
-                                    </tr>"""
+                                    <div class="summary">
+                                        <div class="summary-item"><strong>Gesamt:</strong> {total_vulns} Schwachstellen</div>
+                                        <div class="summary-item"><strong>CVEs:</strong> {cve_count}</div>
+                                        <div class="summary-item"><strong>Betroffene Ports:</strong> {len(vuln_data)}</div>
+                                    </div>"""
 
-                            vuln_html += """
-                                </table>"""
+                            # Tabellarische Übersicht für schnellen Überblick
+                            if vuln_data:
+                                vuln_html += """
+                                    <h2>Übersicht der Schwachstellen</h2>
+                                    <table>
+                                        <tr>
+                                            <th>Port</th>
+                                            <th>Schwachstellen</th>
+                                            <th>CVEs</th>
+                                        </tr>"""
 
-                        # Schwachstellen nach Ports gruppieren und anzeigen
-                        if not vuln_data:
-                            vuln_html += '<div class="no-vulns">Keine Schwachstellen für dieses Gerät gefunden.</div>'
-                        else:
-                            vuln_html += "<h2>Detaillierte Schwachstellenanalyse</h2>"
-                            for port, vulnerabilities in vuln_data.items():
-                                if not vulnerabilities:
-                                    continue
-
-                                vuln_html += f"""
-                                <div class="port-section">
-                                    <div class="port-header">Port {port}</div>
-                                    <div class="port-content">"""
-
-                                # Nach CVEs und anderen Schwachstellen kategorisieren
-                                cves = {}
-                                scripts = {}
-                                others = {}
-
-                                for vuln_name, vuln_desc in vulnerabilities.items():
-                                    if isinstance(vuln_desc, dict):
-                                        # Falls verschachtelte JSON-Struktur
-                                        vuln_desc = json.dumps(vuln_desc, indent=2)
-
-                                    if not isinstance(vuln_desc, str):
-                                        # Sicherstellen, dass die Beschreibung ein String ist
-                                        vuln_desc = str(vuln_desc)
-
-                                    if 'CVE-' in vuln_name or vuln_name.startswith('CVE-'):
-                                        cves[vuln_name] = vuln_desc
-                                    elif vuln_name.startswith('http-') or vuln_name.startswith(
-                                            'ssl-') or vuln_name.startswith('ftp-'):
-                                        scripts[vuln_name] = vuln_desc
-                                    else:
-                                        others[vuln_name] = vuln_desc
-
-                                # CVEs anzeigen (falls vorhanden)
-                                if cves:
-                                    vuln_html += f"<h3>CVEs ({len(cves)})</h3>"
-                                    for vuln_name, vuln_desc in cves.items():
-                                        vuln_html += f"""
-                                        <div class="vulnerability cve">
-                                            <div class="vuln-name">{vuln_name}</div>
-                                            <div class="vuln-description">{vuln_desc}</div>
-                                        </div>
-                                        """
-
-                                # Script-Ergebnisse anzeigen
-                                if scripts:
-                                    vuln_html += f"<h3>Script-Ergebnisse ({len(scripts)})</h3>"
-                                    for vuln_name, vuln_desc in scripts.items():
-                                        vuln_html += f"""
-                                        <div class="vulnerability info">
-                                            <div class="vuln-name">{vuln_name}</div>
-                                            <div class="vuln-description">{vuln_desc}</div>
-                                        </div>
-                                        """
-
-                                # Andere Schwachstellen anzeigen
-                                if others:
-                                    vuln_html += f"<h3>Weitere Informationen ({len(others)})</h3>"
-                                    for vuln_name, vuln_desc in others.items():
-                                        vuln_html += f"""
-                                        <div class="vulnerability warning">
-                                            <div class="vuln-name">{vuln_name}</div>
-                                            <div class="vuln-description">{vuln_desc}</div>
-                                        </div>
-                                        """
+                                for port, vulns in vuln_data.items():
+                                    cve_count = sum(1 for k in vulns.keys() if 'CVE-' in k or k.startswith('CVE-'))
+                                    vuln_html += f"""
+                                        <tr>
+                                            <td>{port}</td>
+                                            <td>{len(vulns)}</td>
+                                            <td>{cve_count}</td>
+                                        </tr>"""
 
                                 vuln_html += """
+                                    </table>"""
+
+                            # Schwachstellen nach Ports gruppieren und anzeigen
+                            if not vuln_data:
+                                vuln_html += '<div class="no-vulns">Keine Schwachstellen für dieses Gerät gefunden.</div>'
+                            else:
+                                vuln_html += "<h2>Detaillierte Schwachstellenanalyse</h2>"
+                                for port, vulnerabilities in vuln_data.items():
+                                    if not vulnerabilities:
+                                        continue
+
+                                    vuln_html += f"""
+                                    <div class="port-section">
+                                        <div class="port-header">Port {port}</div>
+                                        <div class="port-content">"""
+
+                                    # Nach CVEs und anderen Schwachstellen kategorisieren
+                                    cves = {}
+                                    scripts = {}
+                                    others = {}
+
+                                    for vuln_name, vuln_desc in vulnerabilities.items():
+                                        if isinstance(vuln_desc, dict):
+                                            # Falls verschachtelte JSON-Struktur
+                                            vuln_desc = json.dumps(vuln_desc, indent=2)
+
+                                        if not isinstance(vuln_desc, str):
+                                            # Sicherstellen, dass die Beschreibung ein String ist
+                                            vuln_desc = str(vuln_desc)
+
+                                        if 'CVE-' in vuln_name or vuln_name.startswith('CVE-'):
+                                            cves[vuln_name] = vuln_desc
+                                        elif vuln_name.startswith('http-') or vuln_name.startswith(
+                                                'ssl-') or vuln_name.startswith('ftp-'):
+                                            scripts[vuln_name] = vuln_desc
+                                        else:
+                                            others[vuln_name] = vuln_desc
+
+                                    # CVEs anzeigen (falls vorhanden)
+                                    if cves:
+                                        vuln_html += f"<h3>CVEs ({len(cves)})</h3>"
+                                        for vuln_name, vuln_desc in cves.items():
+                                            vuln_html += f"""
+                                            <div class="vulnerability cve">
+                                                <div class="vuln-name">{vuln_name}</div>
+                                                <div class="vuln-description">{vuln_desc}</div>
+                                            </div>
+                                            """
+
+                                    # Script-Ergebnisse anzeigen
+                                    if scripts:
+                                        vuln_html += f"<h3>Script-Ergebnisse ({len(scripts)})</h3>"
+                                        for vuln_name, vuln_desc in scripts.items():
+                                            vuln_html += f"""
+                                            <div class="vulnerability info">
+                                                <div class="vuln-name">{vuln_name}</div>
+                                                <div class="vuln-description">{vuln_desc}</div>
+                                            </div>
+                                            """
+
+                                    # Andere Schwachstellen anzeigen
+                                    if others:
+                                        vuln_html += f"<h3>Weitere Informationen ({len(others)})</h3>"
+                                        for vuln_name, vuln_desc in others.items():
+                                            vuln_html += f"""
+                                            <div class="vulnerability warning">
+                                                <div class="vuln-name">{vuln_name}</div>
+                                                <div class="vuln-description">{vuln_desc}</div>
+                                            </div>
+                                            """
+
+                                    vuln_html += """
+                                        </div>
                                     </div>
+                                    """
+
+                            # HTML-Dokument abschließen
+                            vuln_html += """
                                 </div>
-                                """
+                            </body>
+                            </html>
+                            """
 
-                        # HTML-Dokument abschließen
-                        vuln_html += """
-                            </div>
-                        </body>
-                        </html>
-                        """
+                            vuln_file_path = os.path.join(report_dir, f'vulners_{ip}.html')
+                            with open(vuln_file_path, 'w', encoding='utf-8') as f:
+                                f.write(vuln_html)
+                            print(f"{Color.GREEN}Detailseite gespeichert: {vuln_file_path}{Color.RESET}")
 
-                        vuln_file_path = os.path.join(report_dir, f'vulners_{ip}.html')
-                        with open(vuln_file_path, 'w', encoding='utf-8') as f:
-                            f.write(vuln_html)
-                        print(f"{Color.GREEN}Detailseite gespeichert: {vuln_file_path}{Color.RESET}")
+                        except Exception as e:
+                            logging.error(
+                                f"Fehler bei Detailseite für {ip if 'ip' in locals() else 'unbekannt'}: {str(e)}")
+                            print(f"{Color.RED}Fehler bei Detailseite: {str(e)}{Color.RESET}")
 
-                    except Exception as e:
-                        logging.error(f"Fehler bei Detailseite für {ip if 'ip' in locals() else 'unbekannt'}: {str(e)}")
-                        print(f"{Color.RED}Fehler bei Detailseite: {str(e)}{Color.RESET}")
+                # Raw vulnerabilities Spalte entfernen, da nicht mehr benötigt
+                devices_df.drop('raw_vulnerabilities', axis=1, inplace=True)
 
-                    # Erstelle Zusammenfassungsseite NACH der Schleife (nicht innerhalb)
-                    self.create_summary_page(report_dir, devices_df, history_df)
-                    print(
-                        f"{Color.GREEN}Zusammenfassungsseite erstellt: {os.path.join(report_dir, 'index.html')}{Color.RESET}")
-
-            # Scan-Historie
-            history_df = pd.read_sql_query("""
-                SELECT
-                    scan_date, scan_type, network_range,
-                    devices_found, duration, status
-                FROM scan_history
-                ORDER BY scan_date DESC
-            """, conn)
+            # HIER die Zusammenfassungsseite erstellen (nach der Schleife)
+            self.create_summary_page(report_dir, devices_df, history_df)
+            print(f"{Color.GREEN}Zusammenfassungsseite erstellt: {os.path.join(report_dir, 'index.html')}{Color.RESET}")
 
             # CSV Export
             devices_csv = os.path.join(report_dir, 'devices.csv')
@@ -1495,7 +1496,7 @@ class IOTScanner:
                                         </div>
                                     </div>
                                 </div>
-                             
+
                                 <h2>Gefundene Geräte</h2>
                                 {devices_html}
 
@@ -1542,7 +1543,7 @@ class IOTScanner:
             # Erstelle ZIP-Archiv
             zip_file = os.path.join(export_dir, f'scan_report_{timestamp}.zip')
             with zipfile.ZipFile(zip_file, 'w') as zipf:
-                for root, _, files in os.walk(export_dir):
+                for root, _, files in os.walk(report_dir):
                     for file in files:
                         file_path = os.path.join(root, file)
                         # Relativer Pfad ab dem Export-Stammverzeichnis
