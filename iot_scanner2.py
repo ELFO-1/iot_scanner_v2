@@ -5,7 +5,7 @@
 ##      Author : ELFO           ##
 ##################################
 #
-# IOT-Netzwerkscanner
+# IOT-Netzwerkscanner  V2.1
 # Ein Tool zur Erkennung und Analyse von IoT-Geräten im Netzwerk
 
 ## Python-Bibliotheken
