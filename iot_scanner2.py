@@ -27,9 +27,6 @@ import threading  # Multithreading-Unterstützung
 from concurrent.futures import ThreadPoolExecutor  # Parallele Ausführung
 import zipfile
 
-# Konfiguration aus ini-Datei laden
-#config = configparser.ConfigParser()
-#config.read('iot_config2.ini')       # Einlesen der Konfigurationsdatei
 
 # Logging konfigurieren für Fehler- und Ereignisprotokollierung
 logging.basicConfig(
@@ -158,7 +155,7 @@ class IOTScanner:
             raise
 
 
-
+    # Scan-Profile laden
     def load_scan_profiles(self) -> Dict:  # Laden der Scan-Profile aus JSON-Datei
         return {
             'quick': {
@@ -388,6 +385,7 @@ class IOTScanner:
                 except Exception as e:
                     logging.error(f"Fehler bei der Geräteidentifikation: {str(e)}")
 
+    # Gerätetyp bestimmen
     def determine_device_type(self, services):
         # Korrigierte Version:
         common_iot_ports = {80, 443, 8080, 8883}
@@ -445,6 +443,7 @@ class IOTScanner:
             logging.error(f"Fehler beim Abrufen der OS-Informationen für {ip}: {str(e)}")
         return {'name': 'Unknown', 'accuracy': 'N/A', 'family': 'Unknown'}
 
+    # Schwachstellen abrufen
     def get_vulnerabilities(self, ip: str) -> Dict:
         vulnerabilities = {}
         try:
@@ -564,6 +563,7 @@ class IOTScanner:
                 print("│" + "─" * 78 + "│")
             print("└" + "─" * 78 + "┘")
 
+        # Scan ergebnisse Block
     def print_scan_results(self, devices: List[Dict]):
         print("\n" + "═" * 80)
         print(f"{Color.GREEN}║ SCAN-ERGEBNISSE{Color.RESET}")
@@ -580,6 +580,7 @@ class IOTScanner:
             print(f"│ Hersteller: {device['manufacturer']:<66} │")
             print("└" + "─" * 78 + "┘")
 
+    # Schwachstellen-Ergebnisse anzeigen
     def print_vulnerability_results(self, ip: str, vulnerabilities: Dict):
         print("\n" + "═" * 80)
         print(f"{Color.RED}║ SCHWACHSTELLENANALYSE FÜR {ip}{Color.RESET}")
@@ -594,6 +595,7 @@ class IOTScanner:
                 print("│" + "─" * 78 + "│")
             print("└" + "─" * 78 + "┘")
 
+    # Gerät in Datenbank speichern
     def save_device_to_db(self, device_info: Dict):
         try:
             conn = sqlite3.connect(self.db_name)
@@ -709,7 +711,6 @@ class IOTScanner:
             ip = device['ip']
             try:
                 print(f"\n{Color.YELLOW}Prüfe Sicherheitslücken für {ip}...{Color.RESET}")
-                # Verwenden Sie stabilere Scan-Optionen
                 self.nm.scan(ip, arguments='-sS -sV --script "vuln and not http-aspnet-debug" --script-timeout 60')
 
                 if ip in self.nm.all_hosts():
@@ -1020,6 +1021,7 @@ class IOTScanner:
             print(f"{Color.RED}Fehler bei der Zusammenfassungsseite: {str(e)}{Color.RESET}")
             return None
 
+    # Export-Funktion hinzufügen
     def export_results(self):
         try:
             # Erstelle Export-Verzeichnis falls nicht vorhanden
@@ -1406,7 +1408,7 @@ class IOTScanner:
                 },
                 escape=False
             )
-
+            
             html_content = f"""
                         <!DOCTYPE html>
                         <html>
