@@ -19,14 +19,36 @@ import csv  # CSV-Dateioperationen
 import pandas as pd  # Datenanalyse und Export
 from datetime import datetime  # Zeitstempel-Generierung
 import sqlite3  # Datenbankverwaltung
-import configparser  # Konfigurationsdatei-Verarbeitung
+import configparser  # Konfigurationsdatei-Verarbenung
 import logging  # Protokollierung von Ereignissen
-from typing import List, Dict, Optional  # Typ-Hints für bessere Code-Lesbarkeit
+from typing import List, Dict, Optional, Tuple, Any  # Typ-Hints für bessere Code-Lesbarkeit
 import sys  # Systemoperationen
 import threading  # Multithreading-Unterstützung
 from concurrent.futures import ThreadPoolExecutor  # Parallele Ausführung
-import zipfile
+import zipfile  # Für ZIP-Archiv-Erstellung
+import socket  # Für Netzwerkverbindungen
+import ssl  # Für SSL-Verbindungen
+import warnings  # Für Warnungen unterdrücken bei SSL-Verbindungen
+from urllib.parse import urlparse  # Für URL-Parsing
 
+# Deaktiviere Warnungen für unverified HTTPS requests
+warnings.filterwarnings('ignore', message='Unverified HTTPS request')
+
+# Optional für Machine Learning
+try:
+    import numpy as np
+    from sklearn.ensemble import RandomForestClassifier
+    import pickle
+    ML_AVAILABLE = True
+except ImportError:
+    ML_AVAILABLE = False
+
+# Optional für Web-Interface
+try:
+    from flask import Flask, render_template, request, jsonify, redirect, url_for, Response, session
+    FLASK_AVAILABLE = True
+except ImportError:
+    FLASK_AVAILABLE = False
 
 # Logging konfigurieren für Fehler- und Ereignisprotokollierung
 logging.basicConfig(
@@ -101,6 +123,21 @@ class IOTScanner:
                 'default_format': 'all'
             }
 
+            # Neue Konfigurationsabschnitte
+            config['ML'] = {
+                'enabled': 'true',
+                'model_path': 'models',
+                'min_confidence': '0.6'
+            }
+
+            config['WEB'] = {
+                'enabled': 'false',
+                'host': '127.0.0.1',
+                'port': '8080',
+                'debug': 'false',
+                'secret_key': 'change_this_to_a_random_string'
+            }
+
             # Speichere Konfiguration
             with open(config_file, 'w') as configfile:
                 config.write(configfile)
@@ -148,14 +185,419 @@ class IOTScanner:
             self.scan_profiles = self.load_scan_profiles()
             self.current_network = None
             self.scanning = False
+            self.web_app = None  # Für Flask-App
+            self.web_thread = None  # Für Web-Interface Thread
+
+            # Neues Attribut für ML-Klassifikation
+            self.device_classifier = None
+            self.device_types = ['Router', 'Smart TV', 'IP Camera', 'Smart Speaker',
+                           'Smart Bulb', 'Thermostat', 'Unknown']
+
+            # ML-System laden falls verfügbar
+            if ML_AVAILABLE and self.config.getboolean('ML', 'enabled', fallback=True):
+                self.setup_device_classification()
+
+            # Datenbank einrichten
             self.setup_database()
+
+            # Erweiterung für Verhaltensdaten
+            self.setup_behavior_database()
 
         except Exception as e:
             logging.critical(f"Fehler bei der Initialisierung: {str(e)}")
             raise
 
+    def setup_behavior_database(self):
+        """Richtet die Tabellen für Verhaltensprofile ein"""
+        try:
+            conn = sqlite3.connect(self.db_name)
+            c = conn.cursor()
 
-    # Scan-Profile laden
+            # Tabelle für Verhaltensdaten
+            c.execute('''CREATE TABLE IF NOT EXISTS behavior_data
+                        (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                         ip TEXT,
+                         mac TEXT,
+                         timestamp TEXT,
+                         active_ports TEXT,
+                         connection_count INTEGER,
+                         data_volume REAL,
+                         unusual_connections TEXT)''')
+
+            # Tabelle für Verhaltensprofile
+            c.execute('''CREATE TABLE IF NOT EXISTS behavior_profiles
+                        (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                         ip TEXT,
+                         mac TEXT,
+                         profile_data TEXT,
+                         created TEXT,
+                         updated TEXT,
+                         confidence REAL)''')
+
+            conn.commit()
+            conn.close()
+
+        except Exception as e:
+            logging.error(f"Fehler beim Einrichten der Verhaltens-Datenbank: {str(e)}")
+
+    def setup_device_classification(self):
+        """Initialisiert das ML-System zur Geräteklassifikation"""
+        if not ML_AVAILABLE:
+            print(f"{Color.YELLOW}scikit-learn nicht installiert. ML-Klassifikation deaktiviert.{Color.RESET}")
+            return
+
+        try:
+            self.device_classifier = RandomForestClassifier(n_estimators=100)
+
+            # Erstelle Model-Verzeichnis falls nicht vorhanden
+            model_path = self.config.get('ML', 'model_path', fallback='models')
+            if not os.path.exists(model_path):
+                os.makedirs(model_path)
+
+            # Überprüfen, ob ein trainiertes Modell existiert
+            model_file = os.path.join(model_path, 'device_classifier.pkl')
+            if os.path.exists(model_file):
+                with open(model_file, 'rb') as f:
+                    self.device_classifier = pickle.load(f)
+                print(f"{Color.GREEN}Geräteklassifikator geladen.{Color.RESET}")
+            else:
+                print(f"{Color.YELLOW}Kein trainiertes Modell gefunden. Verwende Heuristiken.{Color.RESET}")
+                self.device_classifier = None
+
+        except Exception as e:
+            logging.error(f"Fehler beim Initialisieren des ML-Systems: {str(e)}")
+            self.device_classifier = None
+
+    def extract_device_features(self, device_info):
+        """Extrahiert Features für die Geräteklassifikation"""
+        # Features: offene Ports, Services, TTL, Response-Zeit, etc.
+        features = []
+
+        # Anzahl offener Ports
+        if 'ports' in device_info:
+            features.append(len(device_info['ports']))
+        else:
+            features.append(0)
+
+        # Bestimmte Services vorhanden?
+        services = []
+        if 'services' in device_info:
+            if isinstance(device_info['services'], str):
+                try:
+                    services_data = json.loads(device_info['services'])
+                    services = [svc.get('name', '').lower() for svc in services_data]
+                except:
+                    services = []
+            else:
+                services = [svc.get('name', '').lower() for svc in device_info.get('services', [])]
+
+        feature_services = ['http', 'https', 'rtsp', 'ssh', 'telnet', 'mdns', 'upnp']
+        for svc in feature_services:
+            features.append(1 if svc in services else 0)
+
+        # Hersteller-Informationen
+        manufacturer = device_info.get('manufacturer', '').lower()
+        iot_manufacturers = ['amazon', 'google', 'samsung', 'xiaomi', 'philips', 'tp-link', 'hikvision']
+        for mfr in iot_manufacturers:
+            features.append(1 if mfr in manufacturer else 0)
+
+        return features
+
+    def classify_device(self, device_info):
+        """Klassifiziert ein Gerät basierend auf seinen Eigenschaften"""
+        if not ML_AVAILABLE or self.device_classifier is None:
+            return self.heuristic_device_type(device_info)
+
+        try:
+            features = self.extract_device_features(device_info)
+            device_type = self.device_types[self.device_classifier.predict([features])[0]]
+            confidence = max(self.device_classifier.predict_proba([features])[0])
+
+            min_confidence = float(self.config.get('ML', 'min_confidence', fallback='0.6'))
+
+            if confidence < min_confidence:  # Bei geringer Konfidenz auf Heuristiken zurückfallen
+                heuristic_type = self.heuristic_device_type(device_info)
+                return f"{heuristic_type} (unsicher)"
+
+            return device_type
+        except Exception as e:
+            logging.error(f"Fehler bei Geräteklassifikation: {str(e)}")
+            return "Unknown"
+
+    def heuristic_device_type(self, device_info):
+        """Bestimmt den Gerätetyp basierend auf Heuristiken"""
+        # Vereinfachte Version von determine_device_type
+        try:
+            # Services extrahieren
+            services = []
+            if 'services' in device_info:
+                if isinstance(device_info['services'], str):
+                    try:
+                        services = json.loads(device_info['services'])
+                    except:
+                        services = []
+                else:
+                    services = device_info['services']
+
+            # MAC-Präfix und Hersteller prüfen
+            manufacturer = device_info.get('manufacturer', '').lower()
+
+            # Router-Hersteller
+            if any(m in manufacturer for m in ['cisco', 'netgear', 'tp-link', 'asus', 'linksys', 'huawei', 'fritzbox', 'avm']):
+                return "Router"
+
+            # Kamera-Hersteller
+            if any(m in manufacturer for m in ['hikvision', 'dahua', 'axis', 'foscam', 'nest', 'ring']):
+                return "IP Camera"
+
+            # Smart Home Geräte
+            if any(m in manufacturer for m in ['philips', 'hue', 'lifx', 'yeelight']):
+                return "Smart Bulb"
+
+            if any(m in manufacturer for m in ['amazon', 'echo']):
+                return "Smart Speaker"
+
+            if any(m in manufacturer for m in ['nest', 'ecobee', 'honeywell']):
+                return "Thermostat"
+
+            if any(m in manufacturer for m in ['samsung', 'lg', 'sony', 'vizio', 'tcl']):
+                return "Smart TV"
+
+            # Prüfe Services
+            service_names = [s.get('name', '').lower() for s in services]
+
+            if any(s in service_names for s in ['rtsp', 'onvif']):
+                return "IP Camera"
+
+            if 'http' in service_names and len(service_names) <= 3:
+                return "IoT Device"
+
+            # Fallback
+            return "Unknown"
+
+        except Exception as e:
+            logging.error(f"Fehler bei Gerätetyp-Heuristik: {str(e)}")
+            return "Unknown"
+
+    def create_behavior_profile(self, ip, days=7):
+        """Erstellt ein Verhaltensprofil für ein bestimmtes Gerät basierend auf historischen Daten"""
+        try:
+            conn = sqlite3.connect(self.db_name)
+
+            # Überprüfen ob das Gerät bekannt ist
+            device_info = pd.read_sql_query("SELECT * FROM devices WHERE ip=?", conn, params=(ip,))
+            if len(device_info) == 0:
+                print(f"{Color.YELLOW}Gerät mit IP {ip} nicht in der Datenbank gefunden.{Color.RESET}")
+                conn.close()
+                return None
+
+            mac = device_info.iloc[0].get('mac', 'N/A')
+
+            # Historische Daten abrufen
+            query = f"""
+                SELECT active_ports, connection_count, data_volume
+                FROM behavior_data
+                WHERE ip = ?
+                AND timestamp > datetime('now', '-{days} days')
+            """
+            data = pd.read_sql_query(query, conn, params=(ip,))
+
+            if len(data) < 5:  # Nicht genug Daten
+                print(f"{Color.YELLOW}Nicht genug Daten für ein Verhaltensprofil. Mindestens 5 Einträge benötigt.{Color.RESET}")
+
+                # Dummy-Daten zum Testen erzeugen
+                if len(data) == 0 and self.config.getboolean('SCAN', 'dummy_data', fallback=False):
+                    print(f"{Color.YELLOW}Erzeuge Dummy-Daten für Beispielzwecke...{Color.RESET}")
+                    # Erzeuge ein paar zufällige Testdaten
+                    import random
+                    for _ in range(10):
+                        ports = ",".join([str(random.randint(1, 65535)) for _ in range(random.randint(1, 5))])
+                        conn_count = random.randint(10, 100)
+                        data_vol = random.uniform(0.1, 10.0)
+                        timestamp = (datetime.now() - pd.Timedelta(days=random.randint(0, days))).strftime("%Y-%m-%d %H:%M:%S")
+
+                        c = conn.cursor()
+                        c.execute("""
+                            INSERT INTO behavior_data
+                            (ip, mac, timestamp, active_ports, connection_count, data_volume, unusual_connections)
+                            VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """, (ip, mac, timestamp, ports, conn_count, data_vol, ""))
+
+                    conn.commit()
+                    print(f"{Color.GREEN}10 Dummy-Datensätze erzeugt für {ip}.{Color.RESET}")
+
+                    # Lade Daten neu
+                    data = pd.read_sql_query(query, conn, params=(ip,))
+                    if len(data) < 5:  # Immer noch nicht genug
+                        conn.close()
+                        return None
+                else:
+                    conn.close()
+                    return None
+
+            # Einfaches Profil: Durchschnitt und Standardabweichung
+            profile = {
+                'ip': ip,
+                'mac': mac,
+                'avg_connections': float(data['connection_count'].mean()),
+                'std_connections': float(data['connection_count'].std()),
+                'avg_data_volume': float(data['data_volume'].mean()),
+                'std_data_volume': float(data['data_volume'].std()),
+                'common_ports': self._get_common_ports(data['active_ports']),
+                'created': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                'days_analyzed': days
+            }
+
+            # Profil in Datenbank speichern
+            c = conn.cursor()
+
+            # Prüfe, ob bereits ein Profil existiert
+            c.execute("SELECT id FROM behavior_profiles WHERE ip=?", (ip,))
+            exists = c.fetchone()
+
+            if exists:
+                c.execute("""
+                    UPDATE behavior_profiles
+                    SET profile_data=?, updated=?, confidence=?
+                    WHERE ip=?
+                """, (
+                    json.dumps(profile),
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    0.8,  # Beispiel-Konfidenzwert
+                    ip
+                ))
+            else:
+                c.execute("""
+                    INSERT INTO behavior_profiles
+                    (ip, mac, profile_data, created, updated, confidence)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, (
+                    ip,
+                    mac,
+                    json.dumps(profile),
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    0.8  # Beispiel-Konfidenzwert
+                ))
+
+            conn.commit()
+            conn.close()
+
+            print(f"{Color.GREEN}Verhaltensprofil für {ip} erstellt und gespeichert.{Color.RESET}")
+            return profile
+
+        except Exception as e:
+            logging.error(f"Fehler bei Erstellung des Verhaltensprofils: {str(e)}")
+            print(f"{Color.RED}Fehler bei Erstellung des Verhaltensprofils: {str(e)}{Color.RESET}")
+            return None
+
+    def _get_common_ports(self, active_ports_series):
+        """Analysiert häufig genutzte Ports aus den Verhaltensdaten"""
+        try:
+            all_ports = []
+            for ports_str in active_ports_series:
+                if not ports_str or not isinstance(ports_str, str):
+                    continue
+                ports = ports_str.split(',')
+                all_ports.extend([int(p.strip()) for p in ports if p.strip().isdigit()])
+
+            if not all_ports:
+                return []
+
+            # Zähle Häufigkeit und gebe die häufigsten 5 Ports zurück
+            from collections import Counter
+            port_counts = Counter(all_ports)
+            return [port for port, _ in port_counts.most_common(5)]
+
+        except Exception as e:
+            logging.error(f"Fehler bei Portanalyse: {str(e)}")
+            return []
+
+    def detect_anomalies(self, ip):
+        """Erkennt ungewöhnliches Verhalten basierend auf dem gespeicherten Profil"""
+        try:
+            conn = sqlite3.connect(self.db_name)
+
+            # Lade das Profil
+            profile_data = pd.read_sql_query(
+                "SELECT profile_data FROM behavior_profiles WHERE ip=?",
+                conn,
+                params=(ip,)
+            )
+
+            if len(profile_data) == 0:
+                print(f"{Color.YELLOW}Kein Profil für {ip} gefunden.{Color.RESET}")
+                conn.close()
+                return None
+
+            profile = json.loads(profile_data.iloc[0]['profile_data'])
+
+            # Lade aktuelle Daten
+            current_data = pd.read_sql_query(
+                "SELECT * FROM behavior_data WHERE ip=? ORDER BY timestamp DESC LIMIT 1",
+                conn,
+                params=(ip,)
+            )
+
+            if len(current_data) == 0:
+                print(f"{Color.YELLOW}Keine aktuellen Daten für {ip} gefunden.{Color.RESET}")
+                conn.close()
+                return None
+
+            anomalies = []
+
+            # Verbindungsanzahl prüfen
+            curr_conns = current_data.iloc[0]['connection_count']
+            if abs(curr_conns - profile['avg_connections']) > 2 * profile['std_connections']:
+                anomalies.append({
+                    'type': 'connection_count',
+                    'expected': profile['avg_connections'],
+                    'actual': curr_conns,
+                    'severity': 'high' if curr_conns > profile['avg_connections'] else 'medium'
+                })
+
+            # Datenvolumen prüfen
+            curr_vol = current_data.iloc[0]['data_volume']
+            if abs(curr_vol - profile['avg_data_volume']) > 2 * profile['std_data_volume']:
+                anomalies.append({
+                    'type': 'data_volume',
+                    'expected': profile['avg_data_volume'],
+                    'actual': curr_vol,
+                    'severity': 'high' if curr_vol > profile['avg_data_volume'] * 2 else 'medium'
+                })
+
+            # Ungewöhnliche Ports prüfen
+            curr_ports = [int(p.strip()) for p in current_data.iloc[0]['active_ports'].split(',') if p.strip().isdigit()]
+            common_ports = profile['common_ports']
+
+            uncommon_ports = [p for p in curr_ports if p not in common_ports]
+            if uncommon_ports:
+                anomalies.append({
+                    'type': 'uncommon_ports',
+                    'ports': uncommon_ports,
+                    'severity': 'medium'
+                })
+
+            conn.close()
+
+            if anomalies:
+                print(f"{Color.RED}Anomalien für {ip} erkannt:{Color.RESET}")
+                for a in anomalies:
+                    print(f"  - Typ: {a['type']}, Schweregrad: {a['severity']}")
+                    if 'expected' in a:
+                        print(f"    Erwartet: {a['expected']:.2f}, Tatsächlich: {a['actual']:.2f}")
+                    if 'ports' in a:
+                        print(f"    Ungewöhnliche Ports: {a['ports']}")
+            else:
+                print(f"{Color.GREEN}Keine Anomalien für {ip} erkannt.{Color.RESET}")
+
+            return anomalies
+
+        except Exception as e:
+            logging.error(f"Fehler bei Anomalieerkennung: {str(e)}")
+            print(f"{Color.RED}Fehler bei Anomalieerkennung: {str(e)}{Color.RESET}")
+            return None
+
     def load_scan_profiles(self) -> Dict:  # Laden der Scan-Profile aus JSON-Datei
         return {
             'quick': {
@@ -170,13 +612,24 @@ class IOTScanner:
             },
             'deep': {
                 'name': 'Deep Scan',
-                'args': '-sS -sV -O -p- --script vuln',
+                'args': '-sS -sV -O -p- --script vulners',
                 'description': 'Umfassender Scan mit Schwachstellenanalyse'
             },
             'stealth': {
                 'name': 'Stealth Scan',
                 'args': '-sS -T2 -f -p21-23,80,443',
                 'description': 'Unauffälliger Scan mit fragmentierten Paketen'
+            },
+            # Neue Profile für Sicherheitstests
+            'ssl_scan': {
+                'name': 'SSL/TLS Scan',
+                'args': '-sS -sV -p443,8443 --script ssl-enum-ciphers',
+                'description': 'Überprüfung von SSL/TLS-Konfigurationen'
+            },
+            'auth_scan': {
+                'name': 'Authentifizierungsprüfung',
+                'args': '-sS -sV -p21-23,80,443,8080,8443 --script "http-auth,ftp-anon"',
+                'description': 'Suche nach schwachen Authentifizierungen'
             }
         }
 
@@ -277,7 +730,7 @@ class IOTScanner:
         if 'vulnerabilities' not in columns:
             c.execute("ALTER TABLE devices ADD COLUMN vulnerabilities TEXT")
 
-        c.execute('''CREATE TABLE IF NOT EXISTS scan_history   
+        c.execute('''CREATE TABLE IF NOT EXISTS scan_history
                     (id INTEGER PRIMARY KEY AUTOINCREMENT,
                      scan_date TEXT,
                      scan_type TEXT,
@@ -285,6 +738,16 @@ class IOTScanner:
                      devices_found INTEGER,
                      duration REAL,
                      status TEXT)''')
+
+        # Neue Tabelle für Sicherheitstests
+        c.execute('''CREATE TABLE IF NOT EXISTS security_tests
+                    (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     ip TEXT,
+                     test_type TEXT,
+                     timestamp TEXT,
+                     result TEXT,
+                     details TEXT,
+                     severity TEXT)''')
 
         conn.commit()
         conn.close()
@@ -385,7 +848,6 @@ class IOTScanner:
                 except Exception as e:
                     logging.error(f"Fehler bei der Geräteidentifikation: {str(e)}")
 
-    # Gerätetyp bestimmen
     def determine_device_type(self, services):
         # Korrigierte Version:
         common_iot_ports = {80, 443, 8080, 8883}
@@ -422,6 +884,11 @@ class IOTScanner:
                 'vulnerabilities': self.get_vulnerabilities(ip)
             }
 
+            # ML-basierte Geräteklassifikation anwenden wenn verfügbar
+            if self.device_classifier is not None:
+                ml_device_type = self.classify_device(device_info)
+                device_info['device_type'] = ml_device_type
+
             self.save_device_to_db(device_info)
             return device_info
         except Exception as e:
@@ -443,7 +910,6 @@ class IOTScanner:
             logging.error(f"Fehler beim Abrufen der OS-Informationen für {ip}: {str(e)}")
         return {'name': 'Unknown', 'accuracy': 'N/A', 'family': 'Unknown'}
 
-    # Schwachstellen abrufen
     def get_vulnerabilities(self, ip: str) -> Dict:
         vulnerabilities = {}
         try:
@@ -542,6 +1008,7 @@ class IOTScanner:
         print(f"│ IP-Adresse:  {device_info['ip']:<67} │")
         print(f"│ MAC-Adresse: {device_info['mac']:<67} │")
         print(f"│ Hersteller:  {device_info['manufacturer']:<67} │")
+        print(f"│ Gerätetyp:   {device_info.get('device_type', 'Unbekannt'):<67} │")
         print("└" + "─" * 78 + "┘")
 
         # Betriebssystem Block
@@ -563,7 +1030,6 @@ class IOTScanner:
                 print("│" + "─" * 78 + "│")
             print("└" + "─" * 78 + "┘")
 
-        # Scan ergebnisse Block
     def print_scan_results(self, devices: List[Dict]):
         print("\n" + "═" * 80)
         print(f"{Color.GREEN}║ SCAN-ERGEBNISSE{Color.RESET}")
@@ -580,7 +1046,6 @@ class IOTScanner:
             print(f"│ Hersteller: {device['manufacturer']:<66} │")
             print("└" + "─" * 78 + "┘")
 
-    # Schwachstellen-Ergebnisse anzeigen
     def print_vulnerability_results(self, ip: str, vulnerabilities: Dict):
         print("\n" + "═" * 80)
         print(f"{Color.RED}║ SCHWACHSTELLENANALYSE FÜR {ip}{Color.RESET}")
@@ -595,7 +1060,6 @@ class IOTScanner:
                 print("│" + "─" * 78 + "│")
             print("└" + "─" * 78 + "┘")
 
-    # Gerät in Datenbank speichern
     def save_device_to_db(self, device_info: Dict):
         try:
             conn = sqlite3.connect(self.db_name)
@@ -699,7 +1163,6 @@ class IOTScanner:
             logging.error(f"Fehler beim Speichern der Scan-Historie: {str(e)}")
 
     # Schwachstellenanalyse durchführen
-    # In der scan_vulnerabilities-Methode
     def scan_vulnerabilities(self, network_range: Optional[str] = None):
         if not network_range:
             network_range = self.current_network or self.default_network
@@ -711,6 +1174,7 @@ class IOTScanner:
             ip = device['ip']
             try:
                 print(f"\n{Color.YELLOW}Prüfe Sicherheitslücken für {ip}...{Color.RESET}")
+                # Verwenden Sie stabilere Scan-Optionen
                 self.nm.scan(ip, arguments='-sS -sV --script "vuln and not http-aspnet-debug" --script-timeout 60')
 
                 if ip in self.nm.all_hosts():
@@ -730,6 +1194,412 @@ class IOTScanner:
             except Exception as e:
                 logging.error(f"Fehler bei der Schwachstellenanalyse für {ip}: {str(e)}")
                 print(f"{Color.RED}Fehler bei {ip}: {str(e)}{Color.RESET}")
+
+    # SSL/TLS-Konfigurationsprüfung
+    def check_ssl_configuration(self, ip, port=443):
+        """Überprüft die SSL/TLS-Konfiguration eines Dienstes"""
+        try:
+            import socket
+            import ssl
+            from datetime import datetime
+
+            print(f"\n{Color.YELLOW}Prüfe SSL/TLS-Konfiguration für {ip}:{port}...{Color.RESET}")
+
+            # 1. Verbindung aufbauen
+            context = ssl.create_default_context()
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE  # Ignoriert selbstsignierte Zertifikate
+
+            conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            conn.settimeout(5.0)
+
+            try:
+                conn.connect((ip, port))
+                ssl_conn = context.wrap_socket(conn, server_hostname=ip)
+            except (socket.timeout, ConnectionRefusedError, ssl.SSLError) as e:
+                print(f"{Color.RED}Verbindungsfehler: {str(e)}{Color.RESET}")
+                return {'ip': ip, 'port': port, 'error': str(e)}
+
+            # 2. Zertifikatsinformationen
+            cert = ssl_conn.getpeercert()
+
+            # 3. Prüfergebnisse
+            results = {
+                'protocol_version': ssl_conn.version(),
+                'cipher': ssl_conn.cipher(),
+                'cert_valid_from': None,
+                'cert_valid_until': None,
+                'cert_issuer': None,
+                'cert_subject': None,
+                'self_signed': None,
+                'weak_cipher': self._check_weak_cipher(ssl_conn.cipher()[0])
+            }
+
+            if cert:
+                results['cert_valid_from'] = cert.get('notBefore', 'Unbekannt')
+                results['cert_valid_until'] = cert.get('notAfter', 'Unbekannt')
+
+                if 'issuer' in cert:
+                    issuer_info = []
+                    for item in cert['issuer']:
+                        for key, value in item:
+                            if key == 'commonName':
+                                issuer_info.append(f"CN={value}")
+                    results['cert_issuer'] = ', '.join(issuer_info)
+
+                if 'subject' in cert:
+                    subject_info = []
+                    for item in cert['subject']:
+                        for key, value in item:
+                            if key == 'commonName':
+                                subject_info.append(f"CN={value}")
+                    results['cert_subject'] = ', '.join(subject_info)
+
+                # Überprüfe auf selbstsignierte Zertifikate
+                results['self_signed'] = results['cert_issuer'] == results['cert_subject']
+
+            # 4. Sicherheitsbewertung
+            security_issues = []
+
+            if results['self_signed']:
+                security_issues.append("Selbstsigniertes Zertifikat")
+
+            if results['weak_cipher']:
+                security_issues.append("Schwache Verschlüsselung")
+
+            # SSL/TLS Version prüfen
+            weak_protocols = ['TLSv1', 'TLSv1.1', 'SSLv2', 'SSLv3']
+            if any(proto in results['protocol_version'] for proto in weak_protocols):
+                security_issues.append(f"Veraltetes Protokoll: {results['protocol_version']}")
+
+            # Zertifikatsgültigkeit prüfen
+            if results['cert_valid_until']:
+                try:
+                    import time
+                    from datetime import datetime
+
+                    # Konvertiere das Datumsformat
+                    expires = time.strptime(results['cert_valid_until'], "%b %d %H:%M:%S %Y %Z")
+                    expiry_date = datetime.fromtimestamp(time.mktime(expires))
+
+                    # Überprüfe, ob das Zertifikat bald abläuft (< 30 Tage)
+                    days_left = (expiry_date - datetime.now()).days
+                    if days_left < 0:
+                        security_issues.append(f"Zertifikat ist abgelaufen")
+                    elif days_left < 30:
+                        security_issues.append(f"Zertifikat läuft in {days_left} Tagen ab")
+                except Exception as e:
+                    logging.error(f"Fehler bei Datumsüberprüfung: {str(e)}")
+
+            # Ergebnisse anzeigen
+            print(f"\n{Color.GREEN}SSL/TLS-Konfiguration für {ip}:{port}{Color.RESET}")
+            print(f"Protokoll: {results['protocol_version']}")
+            print(f"Cipher Suite: {results['cipher'][0]}")
+            if results['cert_subject']:
+                print(f"Ausgestellt für: {results['cert_subject']}")
+            if results['cert_issuer']:
+                print(f"Ausgestellt von: {results['cert_issuer']}")
+            if results['cert_valid_from'] and results['cert_valid_until']:
+                print(f"Gültig von: {results['cert_valid_from']} bis {results['cert_valid_until']}")
+
+            if security_issues:
+                print(f"\n{Color.RED}Sicherheitsprobleme gefunden:{Color.RESET}")
+                for issue in security_issues:
+                    print(f"  - {issue}")
+
+                # Speichere Ergebnisse in der Datenbank
+                self._save_security_test(ip, 'ssl_tls', security_issues, 'high' if len(security_issues) > 1 else 'medium')
+            else:
+                print(f"\n{Color.GREEN}Keine kritischen Sicherheitsprobleme gefunden.{Color.RESET}")
+                self._save_security_test(ip, 'ssl_tls', ['Keine Probleme gefunden'], 'low')
+
+            ssl_conn.close()
+            return {'ip': ip, 'port': port, 'results': results, 'issues': security_issues}
+
+        except Exception as e:
+            logging.error(f"Fehler bei SSL-Überprüfung: {str(e)}")
+            print(f"{Color.RED}Fehler: {str(e)}{Color.RESET}")
+            return {'ip': ip, 'port': port, 'error': str(e)}
+
+    def _check_weak_cipher(self, cipher_name):
+        """Prüft, ob eine Cipher-Suite als schwach gilt"""
+        weak_ciphers = [
+            'NULL', 'EXPORT', 'RC4', 'DES', '3DES', 'MD5', 'CBC', 'anon'
+        ]
+        return any(weak in cipher_name for weak in weak_ciphers)
+
+    def _save_security_test(self, ip, test_type, issues, severity):
+        """Speichert die Ergebnisse eines Sicherheitstests in der Datenbank"""
+        try:
+            conn = sqlite3.connect(self.db_name)
+            c = conn.cursor()
+            c.execute("""
+                INSERT INTO security_tests
+                (ip, test_type, timestamp, result, details, severity)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (
+                ip,
+                test_type,
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                'fail' if severity != 'low' else 'pass',
+                json.dumps(issues),
+                severity
+            ))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logging.error(f"Fehler beim Speichern des Sicherheitstests: {str(e)}")
+
+    def check_default_credentials(self, ip, device_type=None):
+        """Testet gängige Standardpasswörter für bekannte Gerätetypen"""
+        # Dictionary mit typischen Standard-Zugangsdaten für IoT-Geräte
+        default_creds = {
+            'Router': [
+                {'port': 80, 'protocol': 'http', 'path': '/login.html', 'user': 'admin', 'pass': 'admin'},
+                {'port': 80, 'protocol': 'http', 'path': '/login.html', 'user': 'admin', 'pass': 'password'},
+                {'port': 23, 'protocol': 'telnet', 'user': 'admin', 'pass': 'admin'}
+            ],
+            'IP Camera': [
+                {'port': 80, 'protocol': 'http', 'path': '/login.asp', 'user': 'admin', 'pass': 'admin'},
+                {'port': 80, 'protocol': 'http', 'path': '/login.asp', 'user': 'admin', 'pass': '1234'},
+                {'port': 80, 'protocol': 'http', 'path': '/login.asp', 'user': 'admin', 'pass': '12345'}
+            ],
+            'Smart Speaker': [
+                {'port': 8080, 'protocol': 'http', 'path': '/setup', 'user': 'admin', 'pass': 'admin'}
+            ],
+            # Standard-Anmeldedaten unabhängig vom Gerätetyp
+            'Generic': [
+                {'port': 80, 'protocol': 'http', 'path': '/', 'user': 'admin', 'pass': 'admin'},
+                {'port': 80, 'protocol': 'http', 'path': '/', 'user': 'admin', 'pass': 'password'},
+                {'port': 23, 'protocol': 'telnet', 'user': 'admin', 'pass': 'admin'},
+                {'port': 22, 'protocol': 'ssh', 'user': 'admin', 'pass': 'admin'},
+                {'port': 22, 'protocol': 'ssh', 'user': 'root', 'pass': 'root'},
+                {'port': 22, 'protocol': 'ssh', 'user': 'root', 'pass': 'password'}
+            ]
+        }
+
+        # Wenn kein Gerätetyp angegeben, alle relevanten Kredentials testen
+        creds_to_test = []
+        if device_type and device_type in default_creds:
+            creds_to_test = default_creds[device_type]
+            # Immer auch generische Credentials testen
+            creds_to_test.extend(default_creds['Generic'])
+        else:
+            for creds in default_creds.values():
+                creds_to_test.extend(creds)
+
+        print(f"\n{Color.YELLOW}Prüfe Standardzugangsdaten für {ip}...{Color.RESET}")
+        vulnerable_creds = []
+
+        # Zuerst offene Ports scannen
+        try:
+            # Nur relevante Ports scannen
+            scan_ports = list(set([str(c['port']) for c in creds_to_test]))
+            ports_str = ",".join(scan_ports)
+
+            print(f"{Color.YELLOW}Scanne Ports {ports_str} auf {ip}...{Color.RESET}")
+            self.nm.scan(ip, arguments=f'-sS -p {ports_str} -n --max-retries 1 --host-timeout 30')
+
+            if ip not in self.nm.all_hosts():
+                print(f"{Color.YELLOW}Host {ip} nicht erreichbar.{Color.RESET}")
+                return []
+
+            # Filtere creds_to_test auf Basis offener Ports
+            open_ports = []
+            for proto in self.nm[ip].all_protocols():
+                for port in self.nm[ip][proto].keys():
+                    if self.nm[ip][proto][port]['state'] == 'open':
+                        open_ports.append(int(port))
+
+            if not open_ports:
+                print(f"{Color.YELLOW}Keine relevanten offenen Ports gefunden.{Color.RESET}")
+                return []
+
+            print(f"{Color.GREEN}Offene Ports: {open_ports}{Color.RESET}")
+
+            creds_to_test = [c for c in creds_to_test if c['port'] in open_ports]
+
+            if not creds_to_test:
+                print(f"{Color.YELLOW}Keine Credentials zum Testen für die offenen Ports.{Color.RESET}")
+                return []
+
+        except Exception as e:
+            logging.error(f"Fehler beim Port-Scan: {str(e)}")
+            print(f"{Color.RED}Fehler beim Port-Scan: {str(e)}{Color.RESET}")
+            # Fahre trotzdem fort mit allen Credentials
+
+        # HTTP Basic Auth testen
+        for cred in [c for c in creds_to_test if c['protocol'] == 'http']:
+            try:
+                url = f"{cred['protocol']}://{ip}:{cred['port']}{cred['path']}"
+                print(f"{Color.YELLOW}Teste {cred['user']}:{cred['pass']} auf {url}{Color.RESET}")
+
+                response = requests.get(url,
+                                       auth=(cred['user'], cred['pass']),
+                                       timeout=5,
+                                       verify=False)
+
+                # Erfolgreiche Anmeldung erkennen (verschiedene Methoden)
+                if response.status_code == 200 and not "login" in response.text.lower():
+                    print(f"{Color.RED}Standardzugangsdaten gefunden! {cred['user']}:{cred['pass']} auf {url}{Color.RESET}")
+                    vulnerable_creds.append({
+                        'service': f"{cred['protocol']}:{cred['port']}",
+                        'username': cred['user'],
+                        'password': cred['pass']
+                    })
+            except requests.exceptions.RequestException as e:
+                print(f"{Color.YELLOW}HTTP-Test fehlgeschlagen für {url}: {str(e)}{Color.RESET}")
+
+        # Telnet-Anmeldung testen
+        for cred in [c for c in creds_to_test if c['protocol'] == 'telnet']:
+            try:
+                import telnetlib
+                print(f"{Color.YELLOW}Teste Telnet {cred['user']}:{cred['pass']} auf {ip}:{cred['port']}{Color.RESET}")
+
+                tn = telnetlib.Telnet(ip, cred['port'], timeout=5)
+
+                # Login-Sequenz
+                tn.read_until(b"login: ", timeout=5)
+                tn.write(cred['user'].encode('ascii') + b"\n")
+                tn.read_until(b"Password: ", timeout=5)
+                tn.write(cred['pass'].encode('ascii') + b"\n")
+
+                # Erfolgreiche Anmeldung erkennen
+                response = tn.read_until(b"#", timeout=5)
+                if b"#" in response or b">" in response:
+                    print(f"{Color.RED}Telnet-Standardzugangsdaten gefunden! {cred['user']}:{cred['pass']}{Color.RESET}")
+                    vulnerable_creds.append({
+                        'service': f"telnet:{cred['port']}",
+                        'username': cred['user'],
+                        'password': cred['pass']
+                    })
+                tn.close()
+            except Exception as e:
+                print(f"{Color.YELLOW}Telnet-Test fehlgeschlagen für {ip}:{cred['port']}: {str(e)}{Color.RESET}")
+
+        # SSH-Anmeldung testen
+        for cred in [c for c in creds_to_test if c['protocol'] == 'ssh']:
+            try:
+                import paramiko
+                print(f"{Color.YELLOW}Teste SSH {cred['user']}:{cred['pass']} auf {ip}:{cred['port']}{Color.RESET}")
+
+                client = paramiko.SSHClient()
+                client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+                client.connect(
+                    hostname=ip,
+                    port=cred['port'],
+                    username=cred['user'],
+                    password=cred['pass'],
+                    timeout=5,
+                    allow_agent=False,
+                    look_for_keys=False
+                )
+
+                # Wenn wir hier sind, war die Anmeldung erfolgreich
+                print(f"{Color.RED}SSH-Standardzugangsdaten gefunden! {cred['user']}:{cred['pass']}{Color.RESET}")
+                vulnerable_creds.append({
+                    'service': f"ssh:{cred['port']}",
+                    'username': cred['user'],
+                    'password': cred['pass']
+                })
+
+                client.close()
+            except ImportError:
+                print(f"{Color.YELLOW}SSH-Tests deaktiviert (paramiko nicht installiert){Color.RESET}")
+                break
+            except Exception as e:
+                print(f"{Color.YELLOW}SSH-Test fehlgeschlagen für {ip}:{cred['port']}: {str(e)}{Color.RESET}")
+
+        if vulnerable_creds:
+            print(f"\n{Color.RED}Gefundene schwache Anmeldedaten für {ip}:{Color.RESET}")
+            for cred in vulnerable_creds:
+                print(f"  - {cred['service']}: {cred['username']}:{cred['password']}")
+
+            # Ergebnisse in der Datenbank speichern
+            self._save_security_test(
+                ip,
+                'default_credentials',
+                [f"{cred['username']}:{cred['password']} auf {cred['service']}" for cred in vulnerable_creds],
+                'high'
+            )
+        else:
+            print(f"{Color.GREEN}Keine angreifbaren Standardzugangsdaten gefunden.{Color.RESET}")
+            self._save_security_test(ip, 'default_credentials', ['Keine schwachen Anmeldedaten gefunden'], 'low')
+
+        return vulnerable_creds
+
+    def test_port_knocking(self, ip, ports_sequence=None, timeout=0.5):
+        """Testet, ob ein System Port-Knocking implementiert hat"""
+        if ports_sequence is None:
+            ports_sequence = [1234, 4321, 8888]
+        elif isinstance(ports_sequence, str):
+            try:
+                ports_sequence = [int(p.strip()) for p in ports_sequence.split(',')]
+            except:
+                print(f"{Color.RED}Ungültige Port-Sequenz. Verwende Standardsequenz.{Color.RESET}")
+                ports_sequence = [1234, 4321, 8888]
+
+        print(f"\n{Color.YELLOW}Teste Port-Knocking auf {ip} mit Sequenz {ports_sequence}...{Color.RESET}")
+
+        # Zielport, der nach erfolgreichen Klopfen offen sein könnte
+        target_ports = [22, 80, 443, 8080]
+
+        # 1. Prüfe, ob die Zielports bereits offen sind
+        open_before = []
+        for port in target_ports:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(timeout)
+            if s.connect_ex((ip, port)) == 0:
+                open_before.append(port)
+            s.close()
+
+        print(f"{Color.YELLOW}Offene Ports vor Knocking: {open_before}{Color.RESET}")
+
+        # 2. Führe Port-Knocking durch
+        for knock_port in ports_sequence:
+            print(f"{Color.YELLOW}Klopfe an Port {knock_port}...{Color.RESET}")
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(timeout)
+            s.connect_ex((ip, knock_port))  # Verbindungsversuch unabhängig vom Ergebnis
+            s.close()
+
+        # 3. Prüfe, ob jetzt neue Ports offen sind
+        print(f"{Color.YELLOW}Warte kurz auf Reaktion des Systems...{Color.RESET}")
+        time.sleep(1)  # Kurz warten, damit das System reagieren kann
+
+        open_after = []
+        for port in target_ports:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(timeout)
+            if s.connect_ex((ip, port)) == 0:
+                open_after.append(port)
+            s.close()
+
+        print(f"{Color.YELLOW}Offene Ports nach Knocking: {open_after}{Color.RESET}")
+
+        # 4. Vergleiche Ergebnisse
+        newly_opened = [port for port in open_after if port not in open_before]
+
+        if newly_opened:
+            print(f"{Color.GREEN}Port-Knocking erkannt! Folgende Ports wurden geöffnet: {newly_opened}{Color.RESET}")
+
+            # Ergebnis in Datenbank speichern
+            self._save_security_test(
+                ip,
+                'port_knocking',
+                [f"Port-Knocking-Sequenz {ports_sequence} öffnet Ports {newly_opened}"],
+                'medium'  # Kein direktes Sicherheitsproblem, aber wichtige Information
+            )
+
+            return {
+                'ip': ip,
+                'knock_sequence': ports_sequence,
+                'newly_opened_ports': newly_opened
+            }
+        else:
+            print(f"{Color.YELLOW}Keine Anzeichen von Port-Knocking mit dieser Sequenz.{Color.RESET}")
+            return None
 
     # Kompletten Scan durchführen
     def complete_scan(self):
@@ -769,9 +1639,6 @@ class IOTScanner:
             self.scanning = False  # Status auch bei Fehler zurücksetzen
             logging.error(f"Fehler beim kompletten Scan: {str(e)}")
             print(f"{Color.RED}Fehler beim Scan: {str(e)}{Color.RESET}")
-
-
-    # Ergebnisse exportieren
 
     # Neue Methode für die Export-Funktion hinzufügen
     def create_summary_page(self, report_dir, devices_df, history_df):
@@ -944,7 +1811,6 @@ class IOTScanner:
                         </tr>
             """
 
-
             # Geräte-Einträge hinzufügen
             for _, row in devices_df.iterrows():
                 summary_html += f"""
@@ -1013,7 +1879,7 @@ class IOTScanner:
             with open(summary_file, 'w', encoding='utf-8') as f:
                 f.write(summary_html)
 
-            print(f"{Color.GREEN}Zusammenfassungsseite gespeichert: {summary_file}{Color.RESET}")
+            print(f"{Color.GREEN}Zusammenfassungsseite erstellt: {summary_file}{Color.RESET}")
             return summary_file
 
         except Exception as e:
@@ -1021,7 +1887,7 @@ class IOTScanner:
             print(f"{Color.RED}Fehler bei der Zusammenfassungsseite: {str(e)}{Color.RESET}")
             return None
 
-    # Export-Funktion hinzufügen
+    # Ergebnisse exportieren
     def export_results(self):
         try:
             # Erstelle Export-Verzeichnis falls nicht vorhanden
@@ -1379,8 +2245,11 @@ class IOTScanner:
                 devices_df.drop('raw_vulnerabilities', axis=1, inplace=True)
 
             # HIER die Zusammenfassungsseite erstellen (nach der Schleife)
-            self.create_summary_page(report_dir, devices_df, history_df)
-            print(f"{Color.GREEN}Zusammenfassungsseite erstellt: {os.path.join(report_dir, 'index.html')}{Color.RESET}")
+            try:
+                self.create_summary_page(report_dir, devices_df, history_df)
+                print(f"{Color.GREEN}Zusammenfassungsseite erstellt: {os.path.join(report_dir, 'index.html')}{Color.RESET}")
+            except Exception as e:
+                print(f"{Color.RED}Fehler bei der Zusammenfassungsseite: {str(e)}{Color.RESET}")
 
             # CSV Export
             devices_csv = os.path.join(report_dir, 'devices.csv')
@@ -1408,7 +2277,7 @@ class IOTScanner:
                 },
                 escape=False
             )
-            
+
             html_content = f"""
                         <!DOCTYPE html>
                         <html>
@@ -1664,31 +2533,6 @@ class IOTScanner:
         except Exception as e:
             logging.error(f"Fehler beim Speichern der Scan-Profile: {str(e)}")
 
-    # laden der Scan-Profile
-    def load_scan_profiles(self) -> Dict:
-        return {
-            'quick': {
-                'name': 'Quick Scan',
-                'args': '-sn -PE -PA21,23,80,3389',
-                'description': 'Schneller Netzwerk-Discovery Scan'
-            },
-            'standard': {
-                'name': 'Standard Scan',
-                'args': '-sS -sV -O -p21-23,80,110,135,139,443,445,3389,8080',
-                'description': 'Standard Scan mit OS-Detection'
-            },
-            'deep': {
-                'name': 'Deep Scan',
-                'args': '-sS -sV -O -p- --script vulners',
-                'description': 'Umfassender Scan mit Schwachstellenanalyse'
-            },
-            'stealth': {
-                'name': 'Stealth Scan',
-                'args': '-sS -T2 -f -p21-23,80,443',
-                'description': 'Unauffälliger Scan mit fragmentierten Paketen'
-            }
-        }
-
     # Scan-Historie anzeigen
     def show_scan_history(self):
         try:
@@ -1746,9 +2590,19 @@ class IOTScanner:
             print(f"10. Export-Pfad: {self.config.get('EXPORT', 'export_path', fallback='exports')}")
             print(f"11. Standard-Format: {self.config.get('EXPORT', 'default_format', fallback='all')}")
 
-            print("\n12. Zurück zum Hauptmenü")
+            # Neue Einstellungen für ML und Web
+            print(f"\n{Color.YELLOW}ML-Einstellungen:{Color.RESET}")
+            print(f"12. ML aktiviert: {self.config.get('ML', 'enabled', fallback='true')}")
+            print(f"13. Modell-Pfad: {self.config.get('ML', 'model_path', fallback='models')}")
 
-            choice = input(f"\n{Color.YELLOW}Wähle eine Option (1-12): {Color.RESET}")
+            print(f"\n{Color.YELLOW}Web-Interface-Einstellungen:{Color.RESET}")
+            print(f"14. Web aktiviert: {self.config.get('WEB', 'enabled', fallback='false')}")
+            print(f"15. Web-Host: {self.config.get('WEB', 'host', fallback='127.0.0.1')}")
+            print(f"16. Web-Port: {self.config.get('WEB', 'port', fallback='8080')}")
+
+            print("\n20. Zurück zum Hauptmenü")
+
+            choice = input(f"\n{Color.YELLOW}Wähle eine Option (1-20): {Color.RESET}")
 
             try:
                 if choice == "1":
@@ -1821,11 +2675,41 @@ class IOTScanner:
                             self.config['EXPORT'] = {}
                         self.config['EXPORT']['default_format'] = new_value
                 elif choice == "12":
+                    new_value = input("ML aktivieren? (true/false): ")
+                    if new_value.lower() in ['true', 'false']:
+                        if 'ML' not in self.config:
+                            self.config['ML'] = {}
+                        self.config['ML']['enabled'] = new_value
+                elif choice == "13":
+                    new_value = input("Neuer Modell-Pfad: ")
+                    if new_value:
+                        if 'ML' not in self.config:
+                            self.config['ML'] = {}
+                        self.config['ML']['model_path'] = new_value
+                elif choice == "14":
+                    new_value = input("Web-Interface aktivieren? (true/false): ")
+                    if new_value.lower() in ['true', 'false']:
+                        if 'WEB' not in self.config:
+                            self.config['WEB'] = {}
+                        self.config['WEB']['enabled'] = new_value
+                elif choice == "15":
+                    new_value = input("Neuer Web-Host (z.B. 127.0.0.1 oder 0.0.0.0): ")
+                    if new_value:
+                        if 'WEB' not in self.config:
+                            self.config['WEB'] = {}
+                        self.config['WEB']['host'] = new_value
+                elif choice == "16":
+                    new_value = input("Neuer Web-Port: ")
+                    if new_value.isdigit():
+                        if 'WEB' not in self.config:
+                            self.config['WEB'] = {}
+                        self.config['WEB']['port'] = new_value
+                elif choice == "20":
                     break
                 else:
                     print(f"{Color.RED}Ungültige Auswahl!{Color.RESET}")
 
-                if choice in [str(i) for i in range(1, 12)]:  # Speichern bei allen Optionen außer "Zurück"
+                if choice in ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16"]:  # Speichern bei allen Optionen außer "Zurück"
                     self._save_config()
 
             except Exception as e:
@@ -1842,10 +2726,1630 @@ class IOTScanner:
             logging.error(f"Fehler beim Speichern der Konfiguration: {str(e)}")
             print(f"{Color.RED}Fehler beim Speichern der Einstellungen: {str(e)}{Color.RESET}")
 
+    # Web-Interface starten
+    def setup_web_interface(self):
+        """Startet die Flask-Web-Oberfläche in einem separaten Thread"""
+        if not FLASK_AVAILABLE:
+            print(f"{Color.RED}Flask nicht installiert. Web-Interface kann nicht gestartet werden.{Color.RESET}")
+            print(f"{Color.YELLOW}Installieren Sie Flask mit: pip install flask{Color.RESET}")
+            return False
+
+        if self.web_thread and self.web_thread.is_alive():
+            host = self.config.get('WEB', 'host', fallback='127.0.0.1')
+            port = self.config.get('WEB', 'port', fallback='8080')
+            print(f"{Color.GREEN}Web-Interface läuft bereits unter: http://{host}:{port}{Color.RESET}")
+            return True
+
+        try:
+            # Erstelle Verzeichnisse für Templates und statische Dateien
+            web_dir = 'web'
+            templates_dir = os.path.join(web_dir, 'templates')
+            static_dir = os.path.join(web_dir, 'static')
+
+            for directory in [web_dir, templates_dir, static_dir]:
+                if not os.path.exists(directory):
+                    os.makedirs(directory)
+
+            # Erstelle eine einfache Beispiel-Template, wenn keine existiert
+            index_template = os.path.join(templates_dir, 'index.html')
+            if not os.path.exists(index_template):
+                with open(index_template, 'w') as f:
+                    f.write("""<!DOCTYPE html>
+    <html lang="de">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>IoT Scanner Dashboard</title>
+        <style>
+            body {
+                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                margin: 0;
+                padding: 20px;
+                background-color: #f5f5f5;
+            }
+            .container {
+                max-width: 1200px;
+                margin: 0 auto;
+                background-color: white;
+                padding: 20px;
+                border-radius: 8px;
+                box-shadow: 0 0 10px rgba(0,0,0,0.1);
+            }
+            header {
+                background-color: #3498db;
+                color: white;
+                padding: 20px;
+                margin-bottom: 20px;
+                border-radius: 8px;
+            }
+            h1 {
+                margin: 0;
+            }
+            .btn {
+                display: inline-block;
+                background-color: #3498db;
+                color: white;
+                padding: 10px 15px;
+                text-decoration: none;
+                border-radius: 4px;
+                margin: 10px 0;
+            }
+            .btn:hover {
+                background-color: #2980b9;
+            }
+            .card {
+                background-color: white;
+                border-radius: 8px;
+                box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+                padding: 20px;
+                margin-bottom: 20px;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <header>
+                <h1>IoT Netzwerk Scanner - Web-Interface</h1>
+            </header>
+
+            <div class="card">
+                <h2>Scanner-Status</h2>
+                <p>Willkommen beim IoT Scanner Web-Interface. Von hier aus können Sie Netzwerk-Scans starten und die Ergebnisse einsehen.</p>
+                <a href="/scan" class="btn">Neuen Scan starten</a>
+                <a href="/devices" class="btn">Gerätliste anzeigen</a>
+            </div>
+
+            <div class="card">
+                <h2>Letzte Scans</h2>
+                <p>Hier werden die letzten Scan-Ergebnisse angezeigt.</p>
+                {% if scans %}
+                    <ul>
+                    {% for scan in scans %}
+                        <li>{{ scan.scan_date }} - {{ scan.scan_type }}: {{ scan.devices_found }} Geräte gefunden</li>
+                    {% endfor %}
+                    </ul>
+                {% else %}
+                    <p>Keine Scan-Historie verfügbar.</p>
+                {% endif %}
+            </div>
+        </div>
+    </body>
+    </html>""")
+
+            devices_template = os.path.join(templates_dir, 'devices.html')
+            if not os.path.exists(devices_template):
+                with open(devices_template, 'w') as f:
+                    f.write("""<!DOCTYPE html>
+    <html lang="de">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Geräteliste - IoT Scanner</title>
+        <style>
+            body {
+                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                margin: 0;
+                padding: 20px;
+                background-color: #f5f5f5;
+            }
+            .container {
+                max-width: 1200px;
+                margin: 0 auto;
+                background-color: white;
+                padding: 20px;
+                border-radius: 8px;
+                box-shadow: 0 0 10px rgba(0,0,0,0.1);
+            }
+            header {
+                background-color: #3498db;
+                color: white;
+                padding: 20px;
+                margin-bottom: 20px;
+                border-radius: 8px;
+            }
+            h1 {
+                margin: 0;
+            }
+            table {
+                width: 100%;
+                border-collapse: collapse;
+            }
+            th, td {
+                padding: 12px;
+                text-align: left;
+                border-bottom: 1px solid #ddd;
+            }
+            th {
+                background-color: #3498db;
+                color: white;
+            }
+            tr:hover {
+                background-color: #f5f5f5;
+            }
+            .btn {
+                display: inline-block;
+                background-color: #3498db;
+                color: white;
+                padding: 8px 12px;
+                text-decoration: none;
+                border-radius: 4px;
+                font-size: 14px;
+            }
+            .btn:hover {
+                background-color: #2980b9;
+            }
+            .back-link {
+                margin-bottom: 20px;
+                display: inline-block;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <header>
+                <h1>Gefundene Geräte im Netzwerk</h1>
+            </header>
+
+            <a href="/" class="back-link btn">Zurück zum Dashboard</a>
+
+            {% if devices %}
+                <table>
+                    <thead>
+                        <tr>
+                            <th>IP-Adresse</th>
+                            <th>MAC-Adresse</th>
+                            <th>Hersteller</th>
+                            <th>Gerätetyp</th>
+                            <th>Betriebssystem</th>
+                            <th>Offene Ports</th>
+                            <th>Zuletzt gesehen</th>
+                            <th>Aktionen</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for device in devices %}
+                        <tr>
+                            <td>{{ device.ip }}</td>
+                            <td>{{ device.mac }}</td>
+                            <td>{{ device.manufacturer }}</td>
+                            <td>{{ device.device_type }}</td>
+                            <td>{{ device.os_name }}</td>
+                            <td>{{ device.open_ports }}</td>
+                            <td>{{ device.last_seen }}</td>
+                            <td>
+                                <a href="/device/{{ device.ip }}" class="btn">Details</a>
+                            </td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            {% else %}
+                <p>Keine Geräte gefunden. Führen Sie zuerst einen Scan durch.</p>
+            {% endif %}
+        </div>
+    </body>
+    </html>""")
+
+            # Erstelle Flask-App
+            from flask import Flask, render_template, request, jsonify, redirect, url_for
+
+            app = Flask(__name__,
+                        template_folder=templates_dir,
+                        static_folder=static_dir)
+
+            app.secret_key = self.config.get('WEB', 'secret_key', fallback='change_this_to_a_random_string')
+
+            scanner_instance = self  # Referenz auf den Scanner
+
+            @app.route('/')
+            def index():
+                # Hole die letzten 5 Scans für die Anzeige
+                try:
+                    conn = sqlite3.connect(scanner_instance.db_name)
+                    scans = pd.read_sql_query("""
+                        SELECT * FROM scan_history
+                        ORDER BY scan_date DESC
+                        LIMIT 5
+                    """, conn).to_dict('records')
+                    conn.close()
+                except Exception as e:
+                    scans = []
+                    logging.error(f"Fehler beim Abrufen der Scan-Historie: {str(e)}")
+
+                return render_template('index.html', scans=scans)
+
+            @app.route('/devices')
+            def devices():
+                # Hole alle Geräte aus der Datenbank
+                try:
+                    conn = sqlite3.connect(scanner_instance.db_name)
+                    devices_df = pd.read_sql_query("SELECT * FROM devices", conn)
+                    devices_list = devices_df.to_dict('records')
+                    conn.close()
+                except Exception as e:
+                    devices_list = []
+                    logging.error(f"Fehler beim Abrufen der Geräte: {str(e)}")
+
+                return render_template('devices.html', devices=devices_list)
+
+            @app.route('/device/<ip>')
+            def device_details(ip):
+                # Hole Details zu einem bestimmten Gerät
+                try:
+                    conn = sqlite3.connect(scanner_instance.db_name)
+                    device = pd.read_sql_query("SELECT * FROM devices WHERE ip=?", conn, params=(ip,)).to_dict(
+                        'records')
+
+                    # Hole Sicherheitstests für dieses Gerät
+                    security_tests = pd.read_sql_query("""
+                        SELECT * FROM security_tests
+                        WHERE ip=?
+                        ORDER BY timestamp DESC
+                    """, conn, params=(ip,)).to_dict('records')
+
+                    conn.close()
+
+                    if not device:
+                        return "Gerät nicht gefunden", 404
+
+                    device = device[0]
+
+                    # Versuche, JSON-Felder zu parsen
+                    try:
+                        if 'services' in device and device['services']:
+                            device['services'] = json.loads(device['services'])
+                        else:
+                            device['services'] = []
+                    except:
+                        device['services'] = []
+
+                    try:
+                        if 'vulnerabilities' in device and device['vulnerabilities']:
+                            device['vulnerabilities'] = json.loads(device['vulnerabilities'])
+                        else:
+                            device['vulnerabilities'] = {}
+                    except:
+                        device['vulnerabilities'] = {}
+
+                    # Wandle Details-Feld in Tests in JSON um
+                    for test in security_tests:
+                        try:
+                            if 'details' in test and test['details']:
+                                test['details'] = json.loads(test['details'])
+                            else:
+                                test['details'] = []
+                        except:
+                            test['details'] = []
+
+                    return render_template('device_detail.html',
+                                           device=device,
+                                           security_tests=security_tests)
+
+                except Exception as e:
+                    logging.error(f"Fehler beim Abrufen der Gerätdetails: {str(e)}")
+                    return f"Fehler: {str(e)}", 500
+
+            @app.route('/scan', methods=['GET', 'POST'])
+            def scan():
+                if request.method == 'POST':
+                    # Startet einen Scan mit den übergebenen Parametern
+                    network = request.form.get('network', scanner_instance.default_network)
+                    scan_type = request.form.get('scan_type', 'quick')
+
+                    # Scan im Hintergrund starten
+                    def run_scan():
+                        if scan_type == 'quick':
+                            scanner_instance.scan_network(network)
+                        elif scan_type == 'deep':
+                            # Setze temporär das Netzwerk
+                            scanner_instance.current_network = network
+                            scanner_instance.complete_scan()
+                        elif scan_type == 'vuln':
+                            scanner_instance.scan_vulnerabilities(network)
+                        elif scan_type in scanner_instance.scan_profiles:
+                            # Custom Scan-Profil verwenden
+                            scanner_instance.nm.scan(hosts=network,
+                                                     arguments=scanner_instance.scan_profiles[scan_type]['args'])
+
+                    scan_thread = threading.Thread(target=run_scan)
+                    scan_thread.daemon = True
+                    scan_thread.start()
+
+                    return redirect(url_for('scan_status'))
+
+                # GET-Anfrage zeigt das Scan-Formular an
+                return render_template('scan.html',
+                                       default_network=scanner_instance.default_network,
+                                       scan_profiles=scanner_instance.scan_profiles)
+
+            @app.route('/scan/status')
+            def scan_status():
+                # Zeigt den aktuellen Scan-Status an
+                return render_template('scan_status.html',
+                                       scanning=scanner_instance.scanning)
+
+            @app.route('/api/scan/status')
+            def api_scan_status():
+                # Gibt den aktuellen Scan-Status als JSON zurück
+                return jsonify({
+                    'scanning': scanner_instance.scanning
+                })
+
+            @app.route('/api/devices')
+            def api_devices():
+                # Gibt alle Geräte als JSON zurück
+                try:
+                    conn = sqlite3.connect(scanner_instance.db_name)
+                    devices_df = pd.read_sql_query("SELECT * FROM devices", conn)
+                    conn.close()
+                    return jsonify(devices_df.to_dict('records'))
+                except Exception as e:
+                    logging.error(f"Fehler beim API-Abruf der Geräte: {str(e)}")
+                    return jsonify({'error': str(e)}), 500
+
+            @app.route('/api/security_test', methods=['POST'])
+            def api_security_test():
+                # Führt einen Sicherheitstest für eine IP durch
+                if not request.is_json:
+                    return jsonify({'error': 'Invalid JSON data'}), 400
+
+                data = request.json
+                ip = data.get('ip')
+                test_type = data.get('test_type')
+
+                if not ip or not test_type:
+                    return jsonify({'error': 'Missing IP or test type'}), 400
+
+                try:
+                    result = None
+
+                    if test_type == 'ssl':
+                        port = data.get('port', 443)
+                        result = scanner_instance.check_ssl_configuration(ip, int(port))
+                    elif test_type == 'default_credentials':
+                        device_type = data.get('device_type')
+                        result = scanner_instance.check_default_credentials(ip, device_type)
+                    elif test_type == 'port_knocking':
+                        ports = data.get('ports', [1234, 4321, 8888])
+                        result = scanner_instance.test_port_knocking(ip, ports)
+
+                    return jsonify({'success': True, 'result': result})
+
+                except Exception as e:
+                    logging.error(f"Fehler beim Sicherheitstest: {str(e)}")
+                    return jsonify({'error': str(e)}), 500
+
+            # Web-Server in eigenem Thread starten
+            def run_webserver():
+                host = scanner_instance.config.get('WEB', 'host', fallback='127.0.0.1')
+                port = int(scanner_instance.config.get('WEB', 'port', fallback='8080'))
+                debug = scanner_instance.config.getboolean('WEB', 'debug', fallback=False)
+
+                app.run(host=host, port=port, debug=debug, threaded=True)
+
+            self.web_thread = threading.Thread(target=run_webserver)
+            self.web_thread.daemon = True
+            self.web_thread.start()
+
+            # Erstelle eine Scan-Template falls sie noch nicht existiert
+            scan_template = os.path.join(templates_dir, 'scan.html')
+            if not os.path.exists(scan_template):
+                with open(scan_template, 'w') as f:
+                    f.write("""<!DOCTYPE html>
+    <html lang="de">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Netzwerk-Scan - IoT Scanner</title>
+        <style>
+            body {
+                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                margin: 0;
+                padding: 20px;
+                background-color: #f5f5f5;
+            }
+            .container {
+                max-width: 800px;
+                margin: 0 auto;
+                background-color: white;
+                padding: 20px;
+                border-radius: 8px;
+                box-shadow: 0 0 10px rgba(0,0,0,0.1);
+            }
+            header {
+                background-color: #3498db;
+                color: white;
+                padding: 20px;
+                margin-bottom: 20px;
+                border-radius: 8px;
+            }
+            h1 {
+                margin: 0;
+            }
+            .form-group {
+                margin-bottom: 15px;
+            }
+            label {
+                display: block;
+                margin-bottom: 5px;
+                font-weight: bold;
+            }
+            input, select {
+                width: 100%;
+                padding: 8px;
+                border: 1px solid #ddd;
+                border-radius: 4px;
+                box-sizing: border-box;
+            }
+            button {
+                background-color: #3498db;
+                color: white;
+                border: none;
+                padding: 10px 15px;
+                border-radius: 4px;
+                cursor: pointer;
+                font-size: 16px;
+            }
+            button:hover {
+                background-color: #2980b9;
+            }
+            .back-link {
+                margin-bottom: 20px;
+                display: inline-block;
+                text-decoration: none;
+                color: #3498db;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <header>
+                <h1>Netzwerk-Scan durchführen</h1>
+            </header>
+
+            <a href="/" class="back-link">Zurück zum Dashboard</a>
+
+            <div class="card">
+                <form action="/scan" method="post">
+                    <div class="form-group">
+                        <label for="network">Netzwerkbereich:</label>
+                        <input type="text" id="network" name="network" value="{{ default_network }}" required>
+                        <small>Format: 192.168.0.0/24 oder 192.168.0.1-10</small>
+                    </div>
+
+                    <div class="form-group">
+                        <label for="scan_type">Scan-Typ:</label>
+                        <select id="scan_type" name="scan_type">
+                            <option value="quick">Quick Scan</option>
+                            <option value="deep">Deep Scan (umfassend)</option>
+                            <option value="vuln">Schwachstellenanalyse</option>
+                            {% for profile_id, profile in scan_profiles.items() %}
+                                <option value="{{ profile_id }}">{{ profile.name }} - {{ profile.description }}</option>
+                            {% endfor %}
+                        </select>
+                    </div>
+
+                    <button type="submit">Scan starten</button>
+                </form>
+            </div>
+        </div>
+    </body>
+    </html>""")
+
+            # Erstelle eine Status-Template falls sie noch nicht existiert
+            status_template = os.path.join(templates_dir, 'scan_status.html')
+            if not os.path.exists(status_template):
+                with open(status_template, 'w') as f:
+                    f.write("""<!DOCTYPE html>
+    <html lang="de">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Scan-Status - IoT Scanner</title>
+        <style>
+            body {
+                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                margin: 0;
+                padding: 20px;
+                background-color: #f5f5f5;
+            }
+            .container {
+                max-width: 800px;
+                margin: 0 auto;
+                background-color: white;
+                padding: 20px;
+                border-radius: 8px;
+                box-shadow: 0 0 10px rgba(0,0,0,0.1);
+            }
+            header {
+                background-color: #3498db;
+                color: white;
+                padding: 20px;
+                margin-bottom: 20px;
+                border-radius: 8px;
+            }
+            h1 {
+                margin: 0;
+            }
+            .status-box {
+                padding: 20px;
+                border-radius: 8px;
+                margin-top: 20px;
+                text-align: center;
+            }
+            .status-running {
+                background-color: #f39c12;
+                color: white;
+            }
+            .status-complete {
+                background-color: #2ecc71;
+                color: white;
+            }
+            .btn {
+                display: inline-block;
+                background-color: #3498db;
+                color: white;
+                padding: 10px 15px;
+                text-decoration: none;
+                border-radius: 4px;
+                margin-top: 20px;
+            }
+            .btn:hover {
+                background-color: #2980b9;
+            }
+            .spinner {
+                border: 4px solid #f3f3f3;
+                border-top: 4px solid #3498db;
+                border-radius: 50%;
+                width: 40px;
+                height: 40px;
+                animation: spin 2s linear infinite;
+                margin: 20px auto;
+            }
+            @keyframes spin {
+                0% { transform: rotate(0deg); }
+                100% { transform: rotate(360deg); }
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <header>
+                <h1>Scan-Status</h1>
+            </header>
+
+            <div id="status-container">
+                {% if scanning %}
+                    <div class="status-box status-running">
+                        <h2>Scan wird ausgeführt...</h2>
+                        <div class="spinner"></div>
+                        <p>Bitte haben Sie Geduld während der Scan durchgeführt wird.</p>
+                    </div>
+                {% else %}
+                    <div class="status-box status-complete">
+                        <h2>Scan abgeschlossen</h2>
+                        <p>Der Scan wurde erfolgreich abgeschlossen.</p>
+                        <a href="/devices" class="btn">Ergebnisse anzeigen</a>
+                    </div>
+                {% endif %}
+            </div>
+        </div>
+
+        {% if scanning %}
+        <script>
+            // Poll for scan status every 3 seconds
+            function checkScanStatus() {
+                fetch('/api/scan/status')
+                    .then(response => response.json())
+                    .then(data => {
+                        if (!data.scanning) {
+                            // If scan is no longer running, refresh the page to show complete status
+                            window.location.reload();
+                        }
+                    })
+                    .catch(error => console.error('Error checking scan status:', error));
+            }
+
+            // Start polling
+            setInterval(checkScanStatus, 3000);
+        </script>
+        {% endif %}
+    </body>
+    </html>""")
+
+            # Erstelle eine Gerätedetail-Template falls sie noch nicht existiert
+            detail_template = os.path.join(templates_dir, 'device_detail.html')
+            if not os.path.exists(detail_template):
+                with open(detail_template, 'w') as f:
+                    f.write("""<!DOCTYPE html>
+    <html lang="de">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Gerätdetails - IoT Scanner</title>
+        <style>
+            body {
+                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                margin: 0;
+                padding: 20px;
+                background-color: #f5f5f5;
+            }
+            .container {
+                max-width: 1200px;
+                margin: 0 auto;
+                background-color: white;
+                padding: 20px;
+                border-radius: 8px;
+                box-shadow: 0 0 10px rgba(0,0,0,0.1);
+            }
+            header {
+                background-color: #3498db;
+                color: white;
+                padding: 20px;
+                margin-bottom: 20px;
+                border-radius: 8px;
+            }
+            h1, h2, h3 {
+                margin-top: 0;
+            }
+            .back-link {
+                margin-bottom: 20px;
+                display: inline-block;
+                text-decoration: none;
+                color: #3498db;
+            }
+            .info-box {
+                background-color: #f8f9fa;
+                border: 1px solid #ddd;
+                border-radius: 4px;
+                padding: 15px;
+                margin-bottom: 20px;
+            }
+            .info-box h3 {
+                margin-top: 0;
+                border-bottom: 1px solid #ddd;
+                padding-bottom: 10px;
+            }
+            .detail-row {
+                display: flex;
+                padding: 8px 0;
+                border-bottom: 1px solid #f0f0f0;
+            }
+            .detail-label {
+                width: 200px;
+                font-weight: bold;
+            }
+            .detail-value {
+                flex: 1;
+            }
+            .btn {
+                display: inline-block;
+                background-color: #3498db;
+                color: white;
+                padding: 8px 12px;
+                text-decoration: none;
+                border-radius: 4px;
+                margin-right: 5px;
+                font-size: 14px;
+            }
+            .btn:hover {
+                background-color: #2980b9;
+            }
+            .btn-red {
+                background-color: #e74c3c;
+            }
+            .btn-red:hover {
+                background-color: #c0392b;
+            }
+            .btn-green {
+                background-color: #2ecc71;
+            }
+            .btn-green:hover {
+                background-color: #27ae60;
+            }
+            .services-table, .vuln-table {
+                width: 100%;
+                border-collapse: collapse;
+                margin-top: 10px;
+            }
+            .services-table th, .services-table td,
+            .vuln-table th, .vuln-table td {
+                border: 1px solid #ddd;
+                padding: 8px;
+                text-align: left;
+            }
+            .services-table th, .vuln-table th {
+                background-color: #f2f2f2;
+            }
+            .severity-high {
+                color: #e74c3c;
+                font-weight: bold;
+            }
+            .severity-medium {
+                color: #f39c12;
+                font-weight: bold;
+            }
+            .severity-low {
+                color: #2ecc71;
+            }
+            .actions-panel {
+                background-color: #f8f9fa;
+                border: 1px solid #ddd;
+                border-radius: 4px;
+                padding: 15px;
+                margin: 20px 0;
+            }
+            .actions-panel h3 {
+                margin-top: 0;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <header>
+                <h1>Gerätdetails: {{ device.ip }}</h1>
+            </header>
+
+            <a href="/devices" class="back-link">Zurück zur Geräteliste</a>
+
+            <div class="info-box">
+                <h3>Basisinformationen</h3>
+                <div class="detail-row">
+                    <div class="detail-label">IP-Adresse:</div>
+                    <div class="detail-value">{{ device.ip }}</div>
+                </div>
+                <div class="detail-row">
+                    <div class="detail-label">MAC-Adresse:</div>
+                    <div class="detail-value">{{ device.mac }}</div>
+                </div>
+                <div class="detail-row">
+                    <div class="detail-label">Hersteller:</div>
+                    <div class="detail-value">{{ device.manufacturer }}</div>
+                </div>
+                <div class="detail-row">
+                    <div class="detail-label">Gerätetyp:</div>
+                    <div class="detail-value">{{ device.device_type }}</div>
+                </div>
+                <div class="detail-row">
+                    <div class="detail-label">Betriebssystem:</div>
+                    <div class="detail-value">{{ device.os_name }} (Genauigkeit: {{ device.os_accuracy }}%)</div>
+                </div>
+                <div class="detail-row">
+                    <div class="detail-label">Status:</div>
+                    <div class="detail-value">{{ device.status }}</div>
+                </div>
+                <div class="detail-row">
+                    <div class="detail-label">Zuletzt gesehen:</div>
+                    <div class="detail-value">{{ device.last_seen }}</div>
+                </div>
+                <div class="detail-row">
+                    <div class="detail-label">Erste Erfassung:</div>
+                    <div class="detail-value">{{ device.first_seen }}</div>
+                </div>
+            </div>
+
+            <div class="info-box">
+                <h3>Offene Ports und Dienste</h3>
+                {% if device.open_ports %}
+                    <div class="detail-row">
+                        <div class="detail-label">Offene Ports:</div>
+                        <div class="detail-value">{{ device.open_ports }}</div>
+                    </div>
+
+                    {% if device.services %}
+                        <h4>Dienste</h4>
+                        <table class="services-table">
+                            <thead>
+                                <tr>
+                                    <th>Port</th>
+                                    <th>Name</th>
+                                    <th>Produkt</th>
+                                    <th>Version</th>
+                                    <th>Extra Info</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {% for service in device.services %}
+                                    <tr>
+                                        <td>{{ service.port }}</td>
+                                        <td>{{ service.name }}</td>
+                                        <td>{{ service.product }}</td>
+                                        <td>{{ service.version }}</td>
+                                        <td>{{ service.extrainfo }}</td>
+                                    </tr>
+                                {% endfor %}
+                            </tbody>
+                        </table>
+                    {% else %}
+                        <p>Keine detaillierten Dienstinformationen verfügbar.</p>
+                    {% endif %}
+                {% else %}
+                    <p>Keine offenen Ports gefunden.</p>
+                {% endif %}
+            </div>
+
+            <div class="info-box">
+                <h3>Schwachstellen</h3>
+                {% if device.vulnerabilities and device.vulnerabilities|length > 0 %}
+                    <p>Gefundene Schwachstellen für dieses Gerät:</p>
+
+                    {% for port, vulns in device.vulnerabilities.items() %}
+                        <h4>Port {{ port }}</h4>
+                        <table class="vuln-table">
+                            <thead>
+                                <tr>
+                                    <th>Schwachstelle</th>
+                                    <th>Details</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {% for vuln_name, vuln_details in vulns.items() %}
+                                    <tr>
+                                        <td>{{ vuln_name }}</td>
+                                        <td>{{ vuln_details }}</td>
+                                    </tr>
+                                {% endfor %}
+                            </tbody>
+                        </table>
+                    {% endfor %}
+                {% else %}
+                    <p>Keine Schwachstellen für dieses Gerät gefunden.</p>
+                {% endif %}
+            </div>
+
+            <div class="actions-panel">
+                <h3>Sicherheitstests durchführen</h3>
+                <button class="btn" onclick="runSecurityTest('ssl')">SSL/TLS-Konfiguration prüfen</button>
+                <button class="btn" onclick="runSecurityTest('default_credentials')">Standard-Anmeldedaten prüfen</button>
+                <button class="btn" onclick="runSecurityTest('port_knocking')">Port-Knocking testen</button>
+            </div>
+
+            <div class="info-box">
+                <h3>Durchgeführte Sicherheitstests</h3>
+                <div id="security-tests-container">
+                    {% if security_tests %}
+                        <table class="vuln-table">
+                            <thead>
+                                <tr>
+                                    <th>Datum</th>
+                                    <th>Test-Typ</th>
+                                    <th>Ergebnis</th>
+                                    <th>Schweregrad</th>
+                                    <th>Details</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {% for test in security_tests %}
+                                    <tr>
+                                        <td>{{ test.timestamp }}</td>
+                                        <td>{{ test.test_type }}</td>
+                                        <td>{{ test.result }}</td>
+                                        <td class="severity-{{ test.severity }}">{{ test.severity }}</td>
+                                        <td>
+                                            {% if test.details %}
+                                                <ul>
+                                                    {% for detail in test.details %}
+                                                        <li>{{ detail }}</li>
+                                                    {% endfor %}
+                                                </ul>
+                                            {% else %}
+                                                -
+                                            {% endif %}
+                                        </td>
+                                    </tr>
+                                {% endfor %}
+                            </tbody>
+                        </table>
+                    {% else %}
+                        <p>Keine Sicherheitstests für dieses Gerät durchgeführt.</p>
+                    {% endif %}
+                </div>
+            </div>
+        </div>
+
+        <script>
+            function runSecurityTest(testType) {
+                // Show loading indicator
+                const container = document.getElementById('security-tests-container');
+                container.innerHTML = '<div class="spinner"></div><p>Test wird durchgeführt...</p>';
+
+                // Prepare test parameters
+                let testData = {
+                    ip: '{{ device.ip }}',
+                    test_type: testType
+                };
+
+                // Add test-specific parameters
+                if (testType === 'ssl') {
+                    // Extract ports with SSL/TLS services
+                    const sslPorts = [
+                        {% for service in device.services %}
+                            {% if service.name in ['https', 'ssl', 'tls'] %}
+                                {{ service.port }},
+                            {% endif %}
+                        {% endfor %}
+                    ];
+
+                    // Default to 443 if no SSL ports found
+                    testData.port = sslPorts.length > 0 ? sslPorts[0] : 443;
+                }
+
+                // Send API request
+                fetch('/api/security_test', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify(testData)
+                })
+                .then(response => response.json())
+                .then(data => {
+                    // Reload the page to show updated test results
+                    window.location.reload();
+                })
+                .catch(error => {
+                    container.innerHTML = `<p class="severity-high">Fehler beim Ausführen des Tests: ${error}</p>`;
+                });
+            }
+        </script>
+    </body>
+    </html>""")
+
+            # Ermitteln Sie die lokale IP-Adresse für Netzwerkzugriff
+            host = self.config.get('WEB', 'host', fallback='127.0.0.1')
+            port = self.config.get('WEB', 'port', fallback='8080')
+
+            # Ermitteln Sie die lokale IP-Adresse für Netzwerkzugriff
+            import socket
+            local_ip = "127.0.0.1"  # Fallback
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.connect(("8.8.8.8", 80))  # Verbindung mit Google DNS
+                local_ip = s.getsockname()[0]
+                s.close()
+            except:
+                pass
+
+            print(f"\n{Color.GREEN}=====================================")
+            print(f"Web-Interface erfolgreich gestartet!")
+            print(f"=====================================")
+            print(f"Lokaler Zugriff: http://{host}:{port}")
+            if host == '0.0.0.0':
+                print(f"Netzwerkzugriff: http://{local_ip}:{port}")
+            print(f"====================================={Color.RESET}\n")
+
+            return True
+
+        except Exception as e:
+            logging.error(f"Fehler beim Starten des Web-Interfaces: {str(e)}")
+            print(f"{Color.RED}Fehler beim Starten des Web-Interfaces: {str(e)}{Color.RESET}")
+            return False
+
+            # Erstelle eine Scan-Template falls sie noch nicht existiert
+            scan_template = os.path.join(templates_dir, 'scan.html')
+            if not os.path.exists(scan_template):
+                with open(scan_template, 'w') as f:
+                    f.write("""<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Netzwerk-Scan - IoT Scanner</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            background-color: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 0 10px rgba(0,0,0,0.1);
+        }
+        header {
+            background-color: #3498db;
+            color: white;
+            padding: 20px;
+            margin-bottom: 20px;
+            border-radius: 8px;
+        }
+        h1 {
+            margin: 0;
+        }
+        .form-group {
+            margin-bottom: 15px;
+        }
+        label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: bold;
+        }
+        input, select {
+            width: 100%;
+            padding: 8px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            box-sizing: border-box;
+        }
+        button {
+            background-color: #3498db;
+            color: white;
+            border: none;
+            padding: 10px 15px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 16px;
+        }
+        button:hover {
+            background-color: #2980b9;
+        }
+        .back-link {
+            margin-bottom: 20px;
+            display: inline-block;
+            text-decoration: none;
+            color: #3498db;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Netzwerk-Scan durchführen</h1>
+        </header>
+
+        <a href="/" class="back-link">Zurück zum Dashboard</a>
+
+        <div class="card">
+            <form action="/scan" method="post">
+                <div class="form-group">
+                    <label for="network">Netzwerkbereich:</label>
+                    <input type="text" id="network" name="network" value="{{ default_network }}" required>
+                    <small>Format: 192.168.0.0/24 oder 192.168.0.1-10</small>
+                </div>
+
+                <div class="form-group">
+                    <label for="scan_type">Scan-Typ:</label>
+                    <select id="scan_type" name="scan_type">
+                        <option value="quick">Quick Scan</option>
+                        <option value="deep">Deep Scan (umfassend)</option>
+                        <option value="vuln">Schwachstellenanalyse</option>
+                        {% for profile_id, profile in scan_profiles.items() %}
+                            <option value="{{ profile_id }}">{{ profile.name }} - {{ profile.description }}</option>
+                        {% endfor %}
+                    </select>
+                </div>
+
+                <button type="submit">Scan starten</button>
+            </form>
+        </div>
+    </div>
+</body>
+</html>""")
+
+            # Erstelle eine Status-Template falls sie noch nicht existiert
+            status_template = os.path.join(templates_dir, 'scan_status.html')
+            if not os.path.exists(status_template):
+                with open(status_template, 'w') as f:
+                    f.write("""<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Scan-Status - IoT Scanner</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            background-color: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 0 10px rgba(0,0,0,0.1);
+        }
+        header {
+            background-color: #3498db;
+            color: white;
+            padding: 20px;
+            margin-bottom: 20px;
+            border-radius: 8px;
+        }
+        h1 {
+            margin: 0;
+        }
+        .status-box {
+            padding: 20px;
+            border-radius: 8px;
+            margin-top: 20px;
+            text-align: center;
+        }
+        .status-running {
+            background-color: #f39c12;
+            color: white;
+        }
+        .status-complete {
+            background-color: #2ecc71;
+            color: white;
+        }
+        .btn {
+            display: inline-block;
+            background-color: #3498db;
+            color: white;
+            padding: 10px 15px;
+            text-decoration: none;
+            border-radius: 4px;
+            margin-top: 20px;
+        }
+        .btn:hover {
+            background-color: #2980b9;
+        }
+        .spinner {
+            border: 4px solid #f3f3f3;
+            border-top: 4px solid #3498db;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 2s linear infinite;
+            margin: 20px auto;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Scan-Status</h1>
+        </header>
+
+        <div id="status-container">
+            {% if scanning %}
+                <div class="status-box status-running">
+                    <h2>Scan wird ausgeführt...</h2>
+                    <div class="spinner"></div>
+                    <p>Bitte haben Sie Geduld während der Scan durchgeführt wird.</p>
+                </div>
+            {% else %}
+                <div class="status-box status-complete">
+                    <h2>Scan abgeschlossen</h2>
+                    <p>Der Scan wurde erfolgreich abgeschlossen.</p>
+                    <a href="/devices" class="btn">Ergebnisse anzeigen</a>
+                </div>
+            {% endif %}
+        </div>
+    </div>
+
+    {% if scanning %}
+    <script>
+        // Poll for scan status every 3 seconds
+        function checkScanStatus() {
+            fetch('/api/scan/status')
+                .then(response => response.json())
+                .then(data => {
+                    if (!data.scanning) {
+                        // If scan is no longer running, refresh the page to show complete status
+                        window.location.reload();
+                    }
+                })
+                .catch(error => console.error('Error checking scan status:', error));
+        }
+
+        // Start polling
+        setInterval(checkScanStatus, 3000);
+    </script>
+    {% endif %}
+</body>
+</html>""")
+
+            # Erstelle eine Gerätedetail-Template falls sie noch nicht existiert
+            detail_template = os.path.join(templates_dir, 'device_detail.html')
+            if not os.path.exists(detail_template):
+                with open(detail_template, 'w') as f:
+                    f.write("""<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gerätdetails - IoT Scanner</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background-color: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 0 10px rgba(0,0,0,0.1);
+        }
+        header {
+            background-color: #3498db;
+            color: white;
+            padding: 20px;
+            margin-bottom: 20px;
+            border-radius: 8px;
+        }
+        h1, h2, h3 {
+            margin-top: 0;
+        }
+        .back-link {
+            margin-bottom: 20px;
+            display: inline-block;
+            text-decoration: none;
+            color: #3498db;
+        }
+        .info-box {
+            background-color: #f8f9fa;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            padding: 15px;
+            margin-bottom: 20px;
+        }
+        .info-box h3 {
+            margin-top: 0;
+            border-bottom: 1px solid #ddd;
+            padding-bottom: 10px;
+        }
+        .detail-row {
+            display: flex;
+            padding: 8px 0;
+            border-bottom: 1px solid #f0f0f0;
+        }
+        .detail-label {
+            width: 200px;
+            font-weight: bold;
+        }
+        .detail-value {
+            flex: 1;
+        }
+        .btn {
+            display: inline-block;
+            background-color: #3498db;
+            color: white;
+            padding: 8px 12px;
+            text-decoration: none;
+            border-radius: 4px;
+            margin-right: 5px;
+            font-size: 14px;
+        }
+        .btn:hover {
+            background-color: #2980b9;
+        }
+        .btn-red {
+            background-color: #e74c3c;
+        }
+        .btn-red:hover {
+            background-color: #c0392b;
+        }
+        .btn-green {
+            background-color: #2ecc71;
+        }
+        .btn-green:hover {
+            background-color: #27ae60;
+        }
+        .services-table, .vuln-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 10px;
+        }
+        .services-table th, .services-table td,
+        .vuln-table th, .vuln-table td {
+            border: 1px solid #ddd;
+            padding: 8px;
+            text-align: left;
+        }
+        .services-table th, .vuln-table th {
+            background-color: #f2f2f2;
+        }
+        .severity-high {
+            color: #e74c3c;
+            font-weight: bold;
+        }
+        .severity-medium {
+            color: #f39c12;
+            font-weight: bold;
+        }
+        .severity-low {
+            color: #2ecc71;
+        }
+        .actions-panel {
+            background-color: #f8f9fa;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            padding: 15px;
+            margin: 20px 0;
+        }
+        .actions-panel h3 {
+            margin-top: 0;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Gerätdetails: {{ device.ip }}</h1>
+        </header>
+
+        <a href="/devices" class="back-link">Zurück zur Geräteliste</a>
+
+        <div class="info-box">
+            <h3>Basisinformationen</h3>
+            <div class="detail-row">
+                <div class="detail-label">IP-Adresse:</div>
+                <div class="detail-value">{{ device.ip }}</div>
+            </div>
+            <div class="detail-row">
+                <div class="detail-label">MAC-Adresse:</div>
+                <div class="detail-value">{{ device.mac }}</div>
+            </div>
+            <div class="detail-row">
+                <div class="detail-label">Hersteller:</div>
+                <div class="detail-value">{{ device.manufacturer }}</div>
+            </div>
+            <div class="detail-row">
+                <div class="detail-label">Gerätetyp:</div>
+                <div class="detail-value">{{ device.device_type }}</div>
+            </div>
+            <div class="detail-row">
+                <div class="detail-label">Betriebssystem:</div>
+                <div class="detail-value">{{ device.os_name }} (Genauigkeit: {{ device.os_accuracy }}%)</div>
+            </div>
+            <div class="detail-row">
+                <div class="detail-label">Status:</div>
+                <div class="detail-value">{{ device.status }}</div>
+            </div>
+            <div class="detail-row">
+                <div class="detail-label">Zuletzt gesehen:</div>
+                <div class="detail-value">{{ device.last_seen }}</div>
+            </div>
+            <div class="detail-row">
+                <div class="detail-label">Erste Erfassung:</div>
+                <div class="detail-value">{{ device.first_seen }}</div>
+            </div>
+        </div>
+
+        <div class="info-box">
+            <h3>Offene Ports und Dienste</h3>
+            {% if device.open_ports %}
+                <div class="detail-row">
+                    <div class="detail-label">Offene Ports:</div>
+                    <div class="detail-value">{{ device.open_ports }}</div>
+                </div>
+
+                {% if device.services %}
+                    <h4>Dienste</h4>
+                    <table class="services-table">
+                        <thead>
+                            <tr>
+                                <th>Port</th>
+                                <th>Name</th>
+                                <th>Produkt</th>
+                                <th>Version</th>
+                                <th>Extra Info</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for service in device.services %}
+                                <tr>
+                                    <td>{{ service.port }}</td>
+                                    <td>{{ service.name }}</td>
+                                    <td>{{ service.product }}</td>
+                                    <td>{{ service.version }}</td>
+                                    <td>{{ service.extrainfo }}</td>
+                                </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                {% else %}
+                    <p>Keine detaillierten Dienstinformationen verfügbar.</p>
+                {% endif %}
+            {% else %}
+                <p>Keine offenen Ports gefunden.</p>
+            {% endif %}
+        </div>
+
+        <div class="info-box">
+            <h3>Schwachstellen</h3>
+            {% if device.vulnerabilities and device.vulnerabilities|length > 0 %}
+                <p>Gefundene Schwachstellen für dieses Gerät:</p>
+
+                {% for port, vulns in device.vulnerabilities.items() %}
+                    <h4>Port {{ port }}</h4>
+                    <table class="vuln-table">
+                        <thead>
+                            <tr>
+                                <th>Schwachstelle</th>
+                                <th>Details</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for vuln_name, vuln_details in vulns.items() %}
+                                <tr>
+                                    <td>{{ vuln_name }}</td>
+                                    <td>{{ vuln_details }}</td>
+                                </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                {% endfor %}
+            {% else %}
+                <p>Keine Schwachstellen für dieses Gerät gefunden.</p>
+            {% endif %}
+        </div>
+
+        <div class="actions-panel">
+            <h3>Sicherheitstests durchführen</h3>
+            <button class="btn" onclick="runSecurityTest('ssl')">SSL/TLS-Konfiguration prüfen</button>
+            <button class="btn" onclick="runSecurityTest('default_credentials')">Standard-Anmeldedaten prüfen</button>
+            <button class="btn" onclick="runSecurityTest('port_knocking')">Port-Knocking testen</button>
+        </div>
+
+        <div class="info-box">
+            <h3>Durchgeführte Sicherheitstests</h3>
+            <div id="security-tests-container">
+                {% if security_tests %}
+                    <table class="vuln-table">
+                        <thead>
+                            <tr>
+                                <th>Datum</th>
+                                <th>Test-Typ</th>
+                                <th>Ergebnis</th>
+                                <th>Schweregrad</th>
+                                <th>Details</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for test in security_tests %}
+                                <tr>
+                                    <td>{{ test.timestamp }}</td>
+                                    <td>{{ test.test_type }}</td>
+                                    <td>{{ test.result }}</td>
+                                    <td class="severity-{{ test.severity }}">{{ test.severity }}</td>
+                                    <td>
+                                        {% if test.details %}
+                                            <ul>
+                                                {% for detail in test.details %}
+                                                    <li>{{ detail }}</li>
+                                                {% endfor %}
+                                            </ul>
+                                        {% else %}
+                                            -
+                                        {% endif %}
+                                    </td>
+                                </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                {% else %}
+                    <p>Keine Sicherheitstests für dieses Gerät durchgeführt.</p>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+
+    <script>
+        function runSecurityTest(testType) {
+            // Show loading indicator
+            const container = document.getElementById('security-tests-container');
+            container.innerHTML = '<div class="spinner"></div><p>Test wird durchgeführt...</p>';
+
+            // Prepare test parameters
+            let testData = {
+                ip: '{{ device.ip }}',
+                test_type: testType
+            };
+
+            // Add test-specific parameters
+            if (testType === 'ssl') {
+                // Extract ports with SSL/TLS services
+                const sslPorts = [
+                    {% for service in device.services %}
+                        {% if service.name in ['https', 'ssl', 'tls'] %}
+                            {{ service.port }},
+                        {% endif %}
+                    {% endfor %}
+                ];
+
+                // Default to 443 if no SSL ports found
+                testData.port = sslPorts.length > 0 ? sslPorts[0] : 443;
+            }
+
+            // Send API request
+            fetch('/api/security_test', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify(testData)
+            })
+            .then(response => response.json())
+            .then(data => {
+                // Reload the page to show updated test results
+                window.location.reload();
+            })
+            .catch(error => {
+                container.innerHTML = `<p class="severity-high">Fehler beim Ausführen des Tests: ${error}</p>`;
+            });
+        }
+    </script>
+</body>
+</html>""")
+
+            return True
+
+        except Exception as e:
+            logging.error(f"Fehler beim Starten des Web-Interfaces: {str(e)}")
+            print(f"{Color.RED}Fehler beim Starten des Web-Interfaces: {str(e)}{Color.RESET}")
+            return False
+
+            # Ermitteln Sie die lokale IP-Adresse für Netzwerkzugriff
+            host = self.config.get('WEB', 'host', fallback='127.0.0.1')
+            port = self.config.get('WEB', 'port', fallback='8080')
+
+            # Ermitteln Sie die lokale IP-Adresse für Netzwerkzugriff
+            import socket
+            local_ip = "127.0.0.1"  # Fallback
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.connect(("8.8.8.8", 80))  # Verbindung mit Google DNS
+                local_ip = s.getsockname()[0]
+                s.close()
+            except:
+                pass
+
+            print(f"\n{Color.GREEN}=====================================")
+            print(f"Web-Interface erfolgreich gestartet!")
+            print(f"=====================================")
+            print(f"Lokaler Zugriff: http://{host}:{port}")
+            if host == '0.0.0.0':
+                print(f"Netzwerkzugriff: http://{local_ip}:{port}")
+            print(f"====================================={Color.RESET}\n")
+
+            return True
+
+        except Exception as e:
+            logging.error(f"Fehler beim Starten des Web-Interfaces: {str(e)}")
+            print(f"{Color.RED}Fehler beim Starten des Web-Interfaces: {str(e)}{Color.RESET}")
+            return False
+
     # Hauptmenü anzeigen
     def show_menu(self):
         while True:
-            print(f"\n{Color.GREEN}=== IOT Netzwerk Scanner v2.0 ==={Color.RESET}")
+            print(f"\n{Color.GREEN}=== IoT Netzwerk Scanner v2.1 ==={Color.RESET}")
             print()
             print(f"{Color.YELLOW}Hauptmenü:{Color.RESET}")
             print()
@@ -1854,14 +4358,23 @@ class IOTScanner:
             print("3. Schwachstellenanalyse")
             print("4. Komplett-Scan")
             print("5. Scan-Profile verwalten")
-            print("6. Benutzerdefinierter Scan")  # Neue Option
+            print("6. Benutzerdefinierter Scan")
             print("7. Ergebnisse exportieren")
             print("8. Scan-Verlauf anzeigen")
             print("9. Einstellungen")
             print()
-            print("10. Beenden")
+            # Neue Menüpunkte
+            print(f"{Color.CYAN}Erweiterte Funktionen:{Color.RESET}")
+            print("10. Gerätetyp-Klassifikation")
+            print("11. Verhaltensprofile erstellen")
+            print("12. SSL/TLS-Konfiguration prüfen")
+            print("13. Standardpasswörter testen")
+            print("14. Port-Knocking-Tests")
+            print("15. Web-Interface starten")
+            print()
+            print("20. Beenden")
 
-            choice = input(f"\n{Color.YELLOW}Wähle eine Option (1-10): {Color.RESET}")
+            choice = input(f"\n{Color.YELLOW}Wähle eine Option: {Color.RESET}")
 
             try:
                 if choice == "1":
@@ -1883,7 +4396,7 @@ class IOTScanner:
                 elif choice == "5":
                     self.manage_scan_profiles()
                 elif choice == "6":
-                    self.custom_scan()  # Neue Option
+                    self.custom_scan()
                 elif choice == "7":
                     self.export_results()
                 elif choice == "8":
@@ -1891,6 +4404,66 @@ class IOTScanner:
                 elif choice == "9":
                     self.show_settings()
                 elif choice == "10":
+                    ip = input(f"{Color.YELLOW}IP-Adresse für Gerätetyp-Klassifikation: {Color.RESET}")
+                    conn = sqlite3.connect(self.db_name)
+                    device_info = pd.read_sql_query("SELECT * FROM devices WHERE ip=?", conn, params=(ip,)).to_dict('records')
+                    conn.close()
+
+                    if device_info:
+                        device_type = self.classify_device(device_info[0])
+                        print(f"{Color.GREEN}Klassifiziertes Gerät: {device_type}{Color.RESET}")
+
+                        # Gerät in DB aktualisieren
+                        conn = sqlite3.connect(self.db_name)
+                        c = conn.cursor()
+                        c.execute("UPDATE devices SET device_type=? WHERE ip=?", (device_type, ip))
+                        conn.commit()
+                        conn.close()
+                    else:
+                        print(f"{Color.RED}Gerät nicht gefunden!{Color.RESET}")
+
+                elif choice == "11":
+                    ip = input(f"{Color.YELLOW}IP-Adresse für Verhaltensprofil: {Color.RESET}")
+                    days = input(f"{Color.YELLOW}Tage für Analyse (Standard: 7): {Color.RESET}") or "7"
+                    profile = self.create_behavior_profile(ip, int(days))
+
+                    if profile:
+                        print(f"{Color.GREEN}Verhaltensprofil erstellt:{Color.RESET}")
+                        for key, value in profile.items():
+                            print(f"  {key}: {value}")
+                    else:
+                        print(f"{Color.RED}Nicht genug Daten für ein Verhaltensprofil!{Color.RESET}")
+
+                elif choice == "12":
+                    ip = input(f"{Color.YELLOW}IP-Adresse für SSL/TLS-Prüfung: {Color.RESET}")
+                    port = input(f"{Color.YELLOW}Port (Standard: 443): {Color.RESET}") or "443"
+                    self.check_ssl_configuration(ip, int(port))
+
+                elif choice == "13":
+                    ip = input(f"{Color.YELLOW}IP-Adresse für Passwort-Test: {Color.RESET}")
+                    device_type = input(f"{Color.YELLOW}Gerätetyp (optional): {Color.RESET}")
+                    self.check_default_credentials(ip, device_type if device_type else None)
+
+                elif choice == "14":
+                    ip = input(f"{Color.YELLOW}IP-Adresse für Port-Knocking-Test: {Color.RESET}")
+                    seq = input(f"{Color.YELLOW}Port-Sequenz (z.B. 1000,2000,3000): {Color.RESET}") or "1000,2000,3000"
+                    ports = [int(p) for p in seq.split(',')]
+                    self.test_port_knocking(ip, ports)
+
+
+                elif choice == "15":
+
+                    if self.setup_web_interface():
+
+                        input(
+                            f"{Color.GREEN}Web-Interface gestartet. Drücke ENTER um zum Menü zurückzukehren.{Color.RESET}")
+
+                    else:
+
+                        input(
+                            f"{Color.RED}Web-Interface konnte nicht gestartet werden. Drücke ENTER um zum Menü zurückzukehren.{Color.RESET}")
+
+                elif choice == "20":
                     print(f"{Color.GREEN}Programm wird beendet...{Color.RESET}")
                     break
                 else:
