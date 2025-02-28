@@ -776,6 +776,19 @@ class IOTScanner:
     def create_summary_page(self, report_dir, devices_df, history_df):
         """Erstellt eine verbesserte Zusammenfassungsseite als HTML"""
         try:
+            # Berechne die Gesamtzahl der Schwachstellen über die HTML-Links
+            vuln_count = 0
+            if 'vulnerabilities' in devices_df.columns:
+                for val in devices_df['vulnerabilities']:
+                    # Extrahiere die Zahl aus dem HTML-Link (falls vorhanden)
+                    if isinstance(val, str) and '🔍' in val:
+                        try:
+                            # Extrahiere die Zahl zwischen "🔍 " und " Schwachstellen"
+                            count_str = val.split('🔍 ')[1].split(' Schwachstellen')[0]
+                            vuln_count += int(count_str)
+                        except:
+                            pass  # Fehler beim Parsen ignorieren
+
             summary_html = f"""<!DOCTYPE html>
             <html lang="de">
             <head>
@@ -911,7 +924,7 @@ class IOTScanner:
                         </div>
                         <div class="card">
                             <div class="card-title">Schwachstellen gesamt</div>
-                            <div class="card-value">{sum(len(json.loads(v)) for v in devices_df['vulnerabilities'].apply(lambda x: '{}' if isinstance(x, str) and not x.strip() else x))}</div>
+                            <div class="card-value">{vuln_count}</div>
                         </div>
                     </div>
 
@@ -929,6 +942,7 @@ class IOTScanner:
                             <th>Zuletzt gesehen</th>
                         </tr>
             """
+
 
             # Geräte-Einträge hinzufügen
             for _, row in devices_df.iterrows():
