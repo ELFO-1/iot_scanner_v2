@@ -456,10 +456,17 @@ class IOTScanner:
                         # Sammle alle verfügbaren Informationen
                         port_vulns = {}
 
-                        # Nmap Script Output
+                        # Nmap Script Output (mit Fehlerbehandlung)
                         if 'script' in port_info:
                             for script_name, output in port_info['script'].items():
-                                port_vulns[script_name] = output
+                                try:
+                                    # Filtern von leeren oder fehlerhaften Ausgaben
+                                    if output and not output.startswith("ERROR:"):
+                                        port_vulns[script_name] = output
+                                    elif output.startswith("ERROR:"):
+                                        logging.warning(f"Script-Fehler für {ip}:{port}/{script_name}: {output}")
+                                except Exception as script_error:
+                                    logging.warning(f"Fehler bei Script-Verarbeitung: {script_error}")
 
                         # CVE-Informationen
                         if 'cve' in port_info:
@@ -690,6 +697,7 @@ class IOTScanner:
             logging.error(f"Fehler beim Speichern der Scan-Historie: {str(e)}")
 
     # Schwachstellenanalyse durchführen
+    # In der scan_vulnerabilities-Methode
     def scan_vulnerabilities(self, network_range: Optional[str] = None):
         if not network_range:
             network_range = self.current_network or self.default_network
@@ -701,7 +709,8 @@ class IOTScanner:
             ip = device['ip']
             try:
                 print(f"\n{Color.YELLOW}Prüfe Sicherheitslücken für {ip}...{Color.RESET}")
-                self.nm.scan(ip, arguments='-sS -sV --script vuln')
+                # Verwenden Sie stabilere Scan-Optionen
+                self.nm.scan(ip, arguments='-sS -sV --script "vuln and not http-aspnet-debug" --script-timeout 60')
 
                 if ip in self.nm.all_hosts():
                     print(f"\n{Color.GREEN}Ergebnisse für {ip}:{Color.RESET}")
@@ -712,8 +721,10 @@ class IOTScanner:
                             if 'script' in self.nm[ip][proto][port]:
                                 print(f"\n{Color.RED}Gefundene Schwachstellen auf Port {port}:{Color.RESET}")
                                 for script_name, output in self.nm[ip][proto][port]['script'].items():
-                                    print(f"  - {script_name}:")
-                                    print(f"    {output}")
+                                    # Filtern von Fehlermeldungen
+                                    if not output.startswith("ERROR:"):
+                                        print(f"  - {script_name}:")
+                                        print(f"    {output}")
 
             except Exception as e:
                 logging.error(f"Fehler bei der Schwachstellenanalyse für {ip}: {str(e)}")
@@ -760,6 +771,241 @@ class IOTScanner:
 
 
     # Ergebnisse exportieren
+
+    # Neue Methode für die Export-Funktion hinzufügen
+    def create_summary_page(self, report_dir, devices_df, history_df):
+        """Erstellt eine verbesserte Zusammenfassungsseite als HTML"""
+        try:
+            summary_html = f"""<!DOCTYPE html>
+            <html lang="de">
+            <head>
+                <meta charset="UTF-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                <title>IoT Scanner - Zusammenfassung</title>
+                <style>
+                    body {{
+                        font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                        margin: 0;
+                        padding: 20px;
+                        background-color: #f5f5f5;
+                        color: #333;
+                        line-height: 1.6;
+                    }}
+                    .container {{
+                        max-width: 1200px;
+                        margin: 0 auto;
+                        background-color: white;
+                        padding: 20px;
+                        border-radius: 8px;
+                        box-shadow: 0 0 10px rgba(0,0,0,0.1);
+                    }}
+                    h1, h2, h3, h4 {{
+                        color: #2c3e50;
+                        margin-top: 20px;
+                    }}
+                    h1 {{
+                        border-bottom: 2px solid #3498db;
+                        padding-bottom: 10px;
+                        margin-top: 0;
+                    }}
+                    .dashboard {{
+                        display: grid;
+                        grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+                        gap: 20px;
+                        margin: 20px 0;
+                    }}
+                    .card {{
+                        background-color: white;
+                        border-radius: 8px;
+                        box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+                        padding: 20px;
+                        text-align: center;
+                    }}
+                    .card-title {{
+                        font-size: 16px;
+                        font-weight: bold;
+                        color: #555;
+                        margin-bottom: 10px;
+                    }}
+                    .card-value {{
+                        font-size: 28px;
+                        font-weight: bold;
+                        color: #3498db;
+                    }}
+                    .device-table {{
+                        width: 100%;
+                        border-collapse: collapse;
+                        margin: 20px 0;
+                    }}
+                    .device-table th,
+                    .device-table td {{
+                        padding: 12px;
+                        border: 1px solid #ddd;
+                        text-align: left;
+                    }}
+                    .device-table th {{
+                        background-color: #3498db;
+                        color: white;
+                        font-weight: normal;
+                    }}
+                    .device-table tr:nth-child(even) {{
+                        background-color: #f8f9fa;
+                    }}
+                    .vuln-high {{
+                        color: #e74c3c;
+                    }}
+                    .vuln-medium {{
+                        color: #f39c12;
+                    }}
+                    .vuln-low {{
+                        color: #2ecc71;
+                    }}
+                    .chart-container {{
+                        width: 100%;
+                        margin: 20px 0;
+                        padding: 20px;
+                        background-color: white;
+                        border-radius: 8px;
+                        box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+                    }}
+                    .btn {{
+                        display: inline-block;
+                        padding: 8px 15px;
+                        background-color: #3498db;
+                        color: white;
+                        text-decoration: none;
+                        border-radius: 4px;
+                        font-size: 14px;
+                        margin-right: 10px;
+                    }}
+                    .btn:hover {{
+                        background-color: #2980b9;
+                    }}
+                    footer {{
+                        margin-top: 30px;
+                        padding-top: 20px;
+                        border-top: 1px solid #ddd;
+                        font-size: 14px;
+                        color: #777;
+                        text-align: center;
+                    }}
+                </style>
+            </head>
+            <body>
+                <div class="container">
+                    <h1>IoT-Netzwerk Scanner - Scanbericht</h1>
+                    <p>Erstellt am: {datetime.now().strftime("%d.%m.%Y %H:%M:%S")}</p>
+
+                    <div class="dashboard">
+                        <div class="card">
+                            <div class="card-title">Gefundene Geräte</div>
+                            <div class="card-value">{len(devices_df)}</div>
+                        </div>
+                        <div class="card">
+                            <div class="card-title">Scans durchgeführt</div>
+                            <div class="card-value">{len(history_df)}</div>
+                        </div>
+                        <div class="card">
+                            <div class="card-title">Unique MAC-Adressen</div>
+                            <div class="card-value">{devices_df['mac'].nunique() if 'mac' in devices_df.columns else 0}</div>
+                        </div>
+                        <div class="card">
+                            <div class="card-title">Schwachstellen gesamt</div>
+                            <div class="card-value">{sum(len(json.loads(v)) for v in devices_df['vulnerabilities'].apply(lambda x: '{}' if isinstance(x, str) and not x.strip() else x))}</div>
+                        </div>
+                    </div>
+
+                    <h2>Geräteübersicht</h2>
+                    <p>Die folgende Tabelle zeigt die wichtigsten Informationen zu allen gefundenen Geräten:</p>
+
+                    <table class="device-table">
+                        <tr>
+                            <th>IP-Adresse</th>
+                            <th>MAC-Adresse</th>
+                            <th>Hersteller</th>
+                            <th>Betriebssystem</th>
+                            <th>Offene Ports</th>
+                            <th>Schwachstellen</th>
+                            <th>Zuletzt gesehen</th>
+                        </tr>
+            """
+
+            # Geräte-Einträge hinzufügen
+            for _, row in devices_df.iterrows():
+                summary_html += f"""
+                        <tr>
+                            <td>{row.get('ip', 'N/A')}</td>
+                            <td>{row.get('mac', 'N/A')}</td>
+                            <td>{row.get('manufacturer', 'Unbekannt')}</td>
+                            <td>{row.get('os_name', 'Unbekannt')}</td>
+                            <td>{row.get('open_ports', 'Keine')}</td>
+                            <td>{row.get('vulnerabilities', 'Keine Schwachstellen gefunden')}</td>
+                            <td>{row.get('last_seen', '-')}</td>
+                        </tr>
+                """
+
+            # Tabelle abschließen
+            summary_html += """
+                    </table>
+
+                    <h2>Scan-Historie</h2>
+                    <p>Übersicht der zuletzt durchgeführten Scans:</p>
+
+                    <table class="device-table">
+                        <tr>
+                            <th>Datum</th>
+                            <th>Scan-Typ</th>
+                            <th>Netzwerkbereich</th>
+                            <th>Gefundene Geräte</th>
+                            <th>Dauer (s)</th>
+                            <th>Status</th>
+                        </tr>
+            """
+
+            # Scan-Historie-Einträge hinzufügen
+            for _, scan in history_df.head(10).iterrows():
+                summary_html += f"""
+                        <tr>
+                            <td>{scan.get('scan_date', '-')}</td>
+                            <td>{scan.get('scan_type', '-')}</td>
+                            <td>{scan.get('network_range', '-')}</td>
+                            <td>{scan.get('devices_found', '0')}</td>
+                            <td>{scan.get('duration', '0'):.2f}</td>
+                            <td>{scan.get('status', '-')}</td>
+                        </tr>
+                """
+
+            # HTML abschließen
+            summary_html += """
+                    </table>
+
+                    <div style="margin-top: 30px; text-align: center;">
+                        <a href="detailed_report.html" class="btn">Detaillierter Bericht</a>
+                        <a href="devices.csv" class="btn">CSV-Export</a>
+                        <a href="devices.json" class="btn">JSON-Export</a>
+                    </div>
+
+                    <footer>
+                        <p>Erstellt mit IoT-Netzwerkscanner v2.0 | ELFO</p>
+                    </footer>
+                </div>
+            </body>
+            </html>
+            """
+
+            # Speichere die HTML-Datei
+            summary_file = os.path.join(report_dir, 'index.html')
+            with open(summary_file, 'w', encoding='utf-8') as f:
+                f.write(summary_html)
+
+            print(f"{Color.GREEN}Zusammenfassungsseite gespeichert: {summary_file}{Color.RESET}")
+            return summary_file
+
+        except Exception as e:
+            logging.error(f"Fehler beim Erstellen der Zusammenfassungsseite: {str(e)}")
+            print(f"{Color.RED}Fehler bei der Zusammenfassungsseite: {str(e)}{Color.RESET}")
+            return None
+
     def export_results(self):
         try:
             # Erstelle Export-Verzeichnis falls nicht vorhanden
@@ -827,44 +1073,288 @@ class IOTScanner:
                     axis=1
                 )
 
-                # Detailseiten-Generierung
+                # Detailseiten-Generierung mit verbesserter Fehlerbehandlung und Darstellung
                 for index, row in devices_df.iterrows():
                     vuln_data = row['raw_vulnerabilities']
-                    if vuln_data:
-                        try:
-                            ip = row['ip']
-                            formatted = json.dumps(vuln_data, indent=4)
+                    try:
+                        ip = row['ip']
 
-                            vuln_html = f"""<!DOCTYPE html>
-                                    <html>
-                                    <head>
-                                        <title>Schwachstellen Details - {ip}</title>
-                                        <style>
-                                            body {{ font-family: Arial, sans-serif; margin: 20px }}
-                                            pre {{
-                                                white-space: pre-wrap;
-                                                background: #f8f9fa;
-                                                padding: 15px;
-                                                border-radius: 5px;
-                                                border: 1px solid #ddd;
-                                            }}
-                                        </style>
-                                    </head>
-                                    <body>
-                                        <h2>Schwachstellen Details für {ip}</h2>
-                                        <pre>{formatted}</pre>
-                                    </body>
-                                    </html>"""
+                        # HTML-Head mit besserer Formatierung
+                        vuln_html = f"""<!DOCTYPE html>
+                        <html lang="de">
+                        <head>
+                            <meta charset="UTF-8">
+                            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                            <title>Schwachstellenanalyse - {ip}</title>
+                            <style>
+                                body {{
+                                    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                                    margin: 0;
+                                    padding: 20px;
+                                    background-color: #f5f5f5;
+                                    color: #333;
+                                    line-height: 1.6;
+                                }}
+                                .container {{
+                                    max-width: 1200px;
+                                    margin: 0 auto;
+                                    background-color: white;
+                                    padding: 20px;
+                                    border-radius: 8px;
+                                    box-shadow: 0 0 10px rgba(0,0,0,0.1);
+                                }}
+                                h1, h2, h3, h4 {{
+                                    color: #2c3e50;
+                                    margin-top: 20px;
+                                }}
+                                h1 {{
+                                    border-bottom: 2px solid #3498db;
+                                    padding-bottom: 10px;
+                                    margin-top: 0;
+                                }}
+                                .port-section {{
+                                    margin-bottom: 30px;
+                                    border: 1px solid #ddd;
+                                    border-radius: 5px;
+                                    overflow: hidden;
+                                }}
+                                .port-header {{
+                                    background-color: #3498db;
+                                    color: white;
+                                    padding: 10px 15px;
+                                    font-size: 18px;
+                                    font-weight: bold;
+                                }}
+                                .port-content {{
+                                    padding: 15px;
+                                }}
+                                .vulnerability {{
+                                    margin-bottom: 15px;
+                                    padding: 15px;
+                                    background-color: #f8f9fa;
+                                    border-left: 4px solid #e74c3c;
+                                    border-radius: 0 5px 5px 0;
+                                }}
+                                .vuln-name {{
+                                    font-weight: bold;
+                                    color: #e74c3c;
+                                    margin-bottom: 5px;
+                                    font-size: 16px;
+                                }}
+                                .vuln-description {{
+                                    white-space: pre-wrap;
+                                    margin-top: 10px;
+                                    padding: 10px;
+                                    background-color: #fff;
+                                    border: 1px solid #ddd;
+                                    border-radius: 4px;
+                                    max-height: 400px;
+                                    overflow-y: auto;
+                                }}
+                                .cve {{
+                                    background-color: #ffebee;
+                                    border-left-color: #c0392b;
+                                }}
+                                .cve .vuln-name {{
+                                    color: #c0392b;
+                                }}
+                                .info {{
+                                    border-left-color: #2196f3;
+                                    background-color: #e3f2fd;
+                                }}
+                                .info .vuln-name {{
+                                    color: #2196f3;
+                                }}
+                                .warning {{
+                                    border-left-color: #f39c12;
+                                    background-color: #fff3e0;
+                                }}
+                                .warning .vuln-name {{
+                                    color: #f39c12;
+                                }}
+                                .info-box {{
+                                    background-color: #e3f2fd;
+                                    border: 1px solid #2196f3;
+                                    border-radius: 4px;
+                                    padding: 15px;
+                                    margin-bottom: 20px;
+                                }}
+                                table {{
+                                    width: 100%;
+                                    border-collapse: collapse;
+                                    margin: 15px 0;
+                                }}
+                                th, td {{
+                                    padding: 10px;
+                                    border: 1px solid #ddd;
+                                    text-align: left;
+                                }}
+                                th {{
+                                    background-color: #f2f2f2;
+                                    font-weight: bold;
+                                }}
+                                .no-vulns {{
+                                    color: #666;
+                                    font-style: italic;
+                                    text-align: center;
+                                    padding: 20px;
+                                }}
+                                .summary {{
+                                    margin-bottom: 20px;
+                                    padding: 10px;
+                                    background-color: #f8f9fa;
+                                    border-radius: 4px;
+                                }}
+                                .summary-item {{
+                                    display: inline-block;
+                                    margin-right: 20px;
+                                    padding: 5px 10px;
+                                    background-color: #e9ecef;
+                                    border-radius: 3px;
+                                }}
+                            </style>
+                        </head>
+                        <body>
+                            <div class="container">
+                                <h1>Schwachstellenanalyse für {ip}</h1>
+                                <div class="info-box">
+                                    <strong>IP-Adresse:</strong> {ip}<br>
+                                    <strong>MAC-Adresse:</strong> {row.get('mac', 'N/A')}<br>
+                                    <strong>Hersteller:</strong> {row.get('manufacturer', 'Unbekannt')}<br>
+                                    <strong>Betriebssystem:</strong> {row.get('os_name', 'Unbekannt')}<br>
+                                    <strong>Offene Ports:</strong> {row.get('open_ports', 'Keine')}<br>
+                                    <strong>Scan-Datum:</strong> {row.get('last_seen', datetime.now().strftime("%Y-%m-%d %H:%M:%S"))}<br>
+                                </div>"""
 
-                            vuln_file_path = os.path.join(report_dir, f'vulners_{ip}.html')
-                            with open(vuln_file_path, 'w', encoding='utf-8') as f:
-                                f.write(vuln_html)
-                            print(f"{Color.GREEN}Detailseite gespeichert: {vuln_file_path}{Color.RESET}")
+                        # Zusammenfassung der gefundenen Schwachstellen
+                        if vuln_data:
+                            total_vulns = sum(len(vulns) for vulns in vuln_data.values())
+                            cve_count = sum(1 for port_vulns in vuln_data.values()
+                                            for k in port_vulns.keys() if 'CVE-' in k or k.startswith('CVE-'))
+                            vuln_html += f"""
+                                <div class="summary">
+                                    <div class="summary-item"><strong>Gesamt:</strong> {total_vulns} Schwachstellen</div>
+                                    <div class="summary-item"><strong>CVEs:</strong> {cve_count}</div>
+                                    <div class="summary-item"><strong>Betroffene Ports:</strong> {len(vuln_data)}</div>
+                                </div>"""
 
-                        except Exception as e:
-                            logging.error(f"Fehler bei Detailseite für {ip}: {str(e)}")
+                        # Tabellarische Übersicht für schnellen Überblick
+                        if vuln_data:
+                            vuln_html += """
+                                <h2>Übersicht der Schwachstellen</h2>
+                                <table>
+                                    <tr>
+                                        <th>Port</th>
+                                        <th>Schwachstellen</th>
+                                        <th>CVEs</th>
+                                    </tr>"""
 
-                devices_df.drop('raw_vulnerabilities', axis=1, inplace=True)
+                            for port, vulns in vuln_data.items():
+                                cve_count = sum(1 for k in vulns.keys() if 'CVE-' in k or k.startswith('CVE-'))
+                                vuln_html += f"""
+                                    <tr>
+                                        <td>{port}</td>
+                                        <td>{len(vulns)}</td>
+                                        <td>{cve_count}</td>
+                                    </tr>"""
+
+                            vuln_html += """
+                                </table>"""
+
+                        # Schwachstellen nach Ports gruppieren und anzeigen
+                        if not vuln_data:
+                            vuln_html += '<div class="no-vulns">Keine Schwachstellen für dieses Gerät gefunden.</div>'
+                        else:
+                            vuln_html += "<h2>Detaillierte Schwachstellenanalyse</h2>"
+                            for port, vulnerabilities in vuln_data.items():
+                                if not vulnerabilities:
+                                    continue
+
+                                vuln_html += f"""
+                                <div class="port-section">
+                                    <div class="port-header">Port {port}</div>
+                                    <div class="port-content">"""
+
+                                # Nach CVEs und anderen Schwachstellen kategorisieren
+                                cves = {}
+                                scripts = {}
+                                others = {}
+
+                                for vuln_name, vuln_desc in vulnerabilities.items():
+                                    if isinstance(vuln_desc, dict):
+                                        # Falls verschachtelte JSON-Struktur
+                                        vuln_desc = json.dumps(vuln_desc, indent=2)
+
+                                    if not isinstance(vuln_desc, str):
+                                        # Sicherstellen, dass die Beschreibung ein String ist
+                                        vuln_desc = str(vuln_desc)
+
+                                    if 'CVE-' in vuln_name or vuln_name.startswith('CVE-'):
+                                        cves[vuln_name] = vuln_desc
+                                    elif vuln_name.startswith('http-') or vuln_name.startswith(
+                                            'ssl-') or vuln_name.startswith('ftp-'):
+                                        scripts[vuln_name] = vuln_desc
+                                    else:
+                                        others[vuln_name] = vuln_desc
+
+                                # CVEs anzeigen (falls vorhanden)
+                                if cves:
+                                    vuln_html += f"<h3>CVEs ({len(cves)})</h3>"
+                                    for vuln_name, vuln_desc in cves.items():
+                                        vuln_html += f"""
+                                        <div class="vulnerability cve">
+                                            <div class="vuln-name">{vuln_name}</div>
+                                            <div class="vuln-description">{vuln_desc}</div>
+                                        </div>
+                                        """
+
+                                # Script-Ergebnisse anzeigen
+                                if scripts:
+                                    vuln_html += f"<h3>Script-Ergebnisse ({len(scripts)})</h3>"
+                                    for vuln_name, vuln_desc in scripts.items():
+                                        vuln_html += f"""
+                                        <div class="vulnerability info">
+                                            <div class="vuln-name">{vuln_name}</div>
+                                            <div class="vuln-description">{vuln_desc}</div>
+                                        </div>
+                                        """
+
+                                # Andere Schwachstellen anzeigen
+                                if others:
+                                    vuln_html += f"<h3>Weitere Informationen ({len(others)})</h3>"
+                                    for vuln_name, vuln_desc in others.items():
+                                        vuln_html += f"""
+                                        <div class="vulnerability warning">
+                                            <div class="vuln-name">{vuln_name}</div>
+                                            <div class="vuln-description">{vuln_desc}</div>
+                                        </div>
+                                        """
+
+                                vuln_html += """
+                                    </div>
+                                </div>
+                                """
+
+                        # HTML-Dokument abschließen
+                        vuln_html += """
+                            </div>
+                        </body>
+                        </html>
+                        """
+
+                        vuln_file_path = os.path.join(report_dir, f'vulners_{ip}.html')
+                        with open(vuln_file_path, 'w', encoding='utf-8') as f:
+                            f.write(vuln_html)
+                        print(f"{Color.GREEN}Detailseite gespeichert: {vuln_file_path}{Color.RESET}")
+
+                    except Exception as e:
+                        logging.error(f"Fehler bei Detailseite für {ip if 'ip' in locals() else 'unbekannt'}: {str(e)}")
+                        print(f"{Color.RED}Fehler bei Detailseite: {str(e)}{Color.RESET}")
+
+                    # Erstelle Zusammenfassungsseite NACH der Schleife (nicht innerhalb)
+                    self.create_summary_page(report_dir, devices_df, history_df)
+                    print(
+                        f"{Color.GREEN}Zusammenfassungsseite erstellt: {os.path.join(report_dir, 'index.html')}{Color.RESET}")
 
             # Scan-Historie
             history_df = pd.read_sql_query("""
