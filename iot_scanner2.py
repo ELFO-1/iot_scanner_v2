@@ -6,7 +6,7 @@
 ##################################
 #
 #
-# IOT-Netzwerkscanner
+# IOT-Netzwerkscanner v2
 # Ein Tool zur Erkennung und Analyse von IoT-Geräten im Netzwerk
 
 ## Python-Bibliotheken
